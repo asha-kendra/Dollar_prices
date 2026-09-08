@@ -1,0 +1,12 @@
+{
+  "name": "dollar-prices",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sync GBP item prices in Zoho Inventory from USD prices held in the Item Attribute custom module.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "sync-gbp-prices": "node scripts/sync-gbp-prices.js"
+  }
+}
