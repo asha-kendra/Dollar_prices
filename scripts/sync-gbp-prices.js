@@ -17,9 +17,11 @@
  * Target: Items module, field "rate" (the org's base/selling currency is GBP).
  *
  * For each Item Attribute record:
- *   gbp_price = round(usd_price * exchange_rate, PRECISION)
- * and that value is written to the linked item's `rate` field, unless it already
- * matches (skip) or --dry-run is set (report only).
+ *   gbp_price = round_to_nearest(usd_price * exchange_rate, ROUND_TO)
+ * i.e. the raw converted price is rounded to the nearest multiple of ROUND_TO
+ * (default: 5, so sales prices land on whole £5 steps: 5, 10, 15, ...), and that
+ * value is written to the linked item's `rate` field, unless it already matches
+ * (skip) or --dry-run is set (report only).
  *
  * If more than one Item Attribute record links to the same item, the most recently
  * modified record wins; conflicts are logged.
@@ -44,10 +46,12 @@
  *     [--price-field=cf_sales_price]
  *     [--rate-field=cf_current_exchange_rate_dollar_to_gbp]
  *     [--fallback-rate-field=cf_currency_ex_rate_dollar_to_gbp]
- *     [--precision=2] [--page-size=200] [--delay-ms=250]
+ *     [--round-to=5] [--page-size=200] [--delay-ms=250]
  *
  *   --dry-run   Compute and log what would change without writing to Zoho.
  *   --force     Write even when the computed price already matches the item's rate.
+ *   --round-to  Round the computed GBP sales price to the nearest multiple of this
+ *               value (default: 5). Use 0 or 1 to disable rounding to whole pounds.
  *
  * Requires Node.js 18+ (built-in fetch).
  * ---------------------------------------------------------------------------
@@ -91,7 +95,7 @@ function loadConfig() {
     priceField: args['price-field'] || 'cf_sales_price',
     rateField: args['rate-field'] || 'cf_current_exchange_rate_dollar_to_gbp',
     fallbackRateField: args['fallback-rate-field'] || 'cf_currency_ex_rate_dollar_to_gbp',
-    precision: Number(args.precision ?? 2),
+    roundTo: Number(args['round-to'] ?? 5),
     pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
   };
@@ -101,9 +105,9 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function round(value, precision) {
-  const factor = 10 ** precision;
-  return Math.round((value + Number.EPSILON) * factor) / factor;
+function roundToNearest(value, multiple) {
+  if (!multiple || multiple <= 0) return value;
+  return Math.round(value / multiple) * multiple;
 }
 
 function toNumber(value) {
@@ -226,7 +230,7 @@ function pickLatestPerItem(records, config) {
     const exchangeRate = resolveExchangeRate(record, config);
     if (usdPrice === null || usdPrice <= 0 || exchangeRate === null) continue;
 
-    const gbpPrice = round(usdPrice * exchangeRate, config.precision);
+    const gbpPrice = roundToNearest(usdPrice * exchangeRate, config.roundTo);
     const candidate = {
       itemId,
       recordId: record.module_record_id,
@@ -288,7 +292,7 @@ async function main() {
     }
 
     const currentRate = toNumber(item.rate) ?? 0;
-    const unchanged = !config.force && Math.abs(currentRate - update.gbpPrice) < 10 ** -config.precision / 2;
+    const unchanged = !config.force && Math.abs(currentRate - update.gbpPrice) < 0.005;
 
     const line =
       `item ${update.itemId} (${item.name}): USD ${update.usdPrice} x ${update.exchangeRate} ` +
