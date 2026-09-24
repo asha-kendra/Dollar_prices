@@ -15,25 +15,31 @@
  * honors a non-EUR base currency (the free plan ignores `base` and always
  * responds in EUR, which would break this).
  *
- * Target: Items module, field "rate" (the org's base/selling currency is GBP).
+ * Target: Items module
+ *   - "rate" (the org's base/selling currency is GBP)
+ *   - custom field cf_main_total = rate * cf_carat_total (confirmed against a
+ *     live item: rate 2045 x cf_carat_total 1.01 = cf_main_total 2065.45)
  *
  * Steps, in order:
  *   1. Fetch items whose CURRENT `cf_status` custom field is one of
  *      ITEM_STATUS_VALUES, using cf_status as a direct server-side search filter
  *      on the Items list endpoint (bulk, paginated - no per-item GET calls).
- *      This also gives us each eligible item's current name/rate. cf_status is
- *      purely a filter here; this script never writes it. Items with any other
- *      status (Sold, Rejected, Faulty, etc.) or no status set are never touched.
+ *      This also gives us each eligible item's current name/rate/cf_carat_total.
+ *      cf_status is purely a filter here; this script never writes it. Items
+ *      with any other status (Sold, Rejected, Faulty, etc.) or no status set
+ *      are never touched.
  *   2. Fetch the USD sales price for each item from the linked cm_jewellery_item
  *      ("Item Attributes") record.
  *   3. Compute gbp_price = round_to_nearest(usd_price * exchange_rate, ROUND_TO)
  *      i.e. the raw converted price rounded to the nearest multiple of ROUND_TO
- *      (default: 5, so sales prices land on whole £5 steps: 5, 10, 15, ...).
- *   4. Write gbp_price to the item's `rate` field in the Items module - only for
- *      items that passed the status filter in step 1. Written EVERY run; the
- *      current value is never compared/skipped, since this runs daily against a
- *      live exchange rate that can genuinely round back to the same GBP price.
- *      Use --dry-run to preview without writing.
+ *      (default: 5, so sales prices land on whole £5 steps: 5, 10, 15, ...), and
+ *      main_total = round_currency(gbp_price * cf_carat_total).
+ *   4. Write gbp_price to the item's `rate` field, and main_total to
+ *      cf_main_total (skipped if the item has no cf_carat_total), in the Items
+ *      module - only for items that passed the status filter in step 1. Written
+ *      EVERY run; the current value is never compared/skipped, since this runs
+ *      daily against a live exchange rate that can genuinely round back to the
+ *      same GBP price. Use --dry-run to preview without writing.
  *
  * If more than one Item Attribute record links to the same item, the most recently
  * modified record wins; conflicts are logged.
@@ -64,6 +70,10 @@
  *                          Items with any other status (or no status set) are
  *                          skipped. Add more values here (e.g. "Available,On Hold,
  *                          Reserved") without any code change.
+ *   CARAT_FIELD            Items-module custom field holding the carat total used to
+ *                          compute cf_main_total. Default: "cf_carat_total".
+ *   MAIN_TOTAL_FIELD       Items-module custom field the computed main total is
+ *                          written to. Default: "cf_main_total".
  *
  * CLI usage:
  *   node scripts/sync-gbp-prices.js [--dry-run]
@@ -71,14 +81,18 @@
  *     [--lookup-field=cf_jewellery_item]
  *     [--price-field=cf_sales_price]
  *     [--status-field=cf_status]
+ *     [--carat-field=cf_carat_total]
+ *     [--main-total-field=cf_main_total]
  *     [--round-to=5] [--page-size=200] [--delay-ms=250]
  *
- *   --dry-run      Compute and log what would change without writing to Zoho.
- *   --status-field Same as ITEM_STATUS_FIELD above; this flag takes precedence
- *                  over the env var when both are set.
- *   --round-to     Round the computed GBP sales price to the nearest multiple of
- *                  this value (default: 5). Use 0 or 1 to disable rounding to
- *                  whole pounds.
+ *   --dry-run          Compute and log what would change without writing to Zoho.
+ *   --status-field     Same as ITEM_STATUS_FIELD above; this flag takes precedence
+ *                      over the env var when both are set.
+ *   --carat-field      Same as CARAT_FIELD above.
+ *   --main-total-field Same as MAIN_TOTAL_FIELD above.
+ *   --round-to         Round the computed GBP sales price to the nearest multiple of
+ *                      this value (default: 5). Use 0 or 1 to disable rounding to
+ *                      whole pounds.
  *
  * Requires Node.js 18+ (built-in fetch).
  * ---------------------------------------------------------------------------
@@ -125,6 +139,8 @@ function loadConfig() {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean),
+    caratField: args['carat-field'] || process.env.CARAT_FIELD || 'cf_carat_total',
+    mainTotalField: args['main-total-field'] || process.env.MAIN_TOTAL_FIELD || 'cf_main_total',
     roundTo: Number(args['round-to'] ?? 5),
     pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
@@ -138,6 +154,10 @@ function sleep(ms) {
 function roundToNearest(value, multiple) {
   if (!multiple || multiple <= 0) return value;
   return Math.round(value / multiple) * multiple;
+}
+
+function roundCurrency(value) {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
 function toNumber(value) {
@@ -328,7 +348,12 @@ async function main() {
     const items = await client.listItemsByStatus(config.statusField, status, config.pageSize);
     console.log(`  ${status}: ${items.length} item(s)`);
     for (const item of items) {
-      eligibleItems.set(item.item_id, { name: item.name, rate: toNumber(item.rate) ?? 0, status });
+      eligibleItems.set(item.item_id, {
+        name: item.name,
+        rate: toNumber(item.rate) ?? 0,
+        status,
+        caratTotal: toNumber(item[config.caratField]),
+      });
     }
   }
   console.log(`${eligibleItems.size} eligible item(s) total.`);
@@ -366,9 +391,20 @@ async function main() {
       continue;
     }
 
+    // cf_main_total = rate * carat total (confirmed against a live item:
+    // rate 2045 x cf_carat_total 1.01 = cf_main_total 2065.45).
+    const mainTotal = item.caratTotal !== null ? roundCurrency(update.gbpPrice * item.caratTotal) : null;
+    if (item.caratTotal === null) {
+      console.warn(
+        `[warn] item ${update.itemId} (${item.name}) has no ${config.caratField}; ` +
+        `leaving ${config.mainTotalField} untouched.`
+      );
+    }
+
     const line =
       `item ${update.itemId} (${item.name}): USD ${update.usdPrice} x ${update.exchangeRate} ` +
-      `= £${update.gbpPrice} (current £${item.rate}, status "${item.status}")`;
+      `= £${update.gbpPrice} (current £${item.rate}, status "${item.status}")` +
+      (mainTotal !== null ? `, ${config.mainTotalField} -> £${mainTotal}` : '');
 
     if (config.dryRun) {
       console.log(`[dry-run] would update ${line}`);
@@ -377,6 +413,9 @@ async function main() {
     }
 
     const body = { name: item.name, rate: update.gbpPrice };
+    if (mainTotal !== null) {
+      body.custom_fields = [{ api_name: config.mainTotalField, value: mainTotal }];
+    }
 
     try {
       await client.updateItem(update.itemId, body);
