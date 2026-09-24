@@ -12,6 +12,9 @@
  *
  * The USD->GBP exchange rate is fetched live from the fixer.io API (one call per
  * run, applied to every record) rather than read from a field on the record.
+ * The call requests base=GBP, symbols=USD; this requires a fixer.io plan that
+ * honors a non-EUR base currency (the free plan ignores `base` and always
+ * responds in EUR, which would break this).
  *
  * Target: Items module, field "rate" (the org's base/selling currency is GBP).
  *
@@ -39,9 +42,7 @@
  * Optional environment variables:
  *   ZOHO_API_DOMAIN        Default: https://www.zohoapis.eu   (Henig Diamonds is EU DC)
  *   ZOHO_ACCOUNTS_DOMAIN   Default: https://accounts.zoho.eu
- *   FIXER_API_BASE         Default: http://data.fixer.io/api   (the free fixer.io plan
- *                          only supports plain HTTP; use https://data.fixer.io/api if
- *                          your plan includes HTTPS)
+ *   FIXER_API_BASE         Default: https://data.fixer.io/api
  *
  * Usage:
  *   node scripts/sync-gbp-prices.js [--dry-run] [--force]
@@ -90,7 +91,7 @@ function loadConfig() {
     apiDomain: (process.env.ZOHO_API_DOMAIN || 'https://www.zohoapis.eu').replace(/\/$/, ''),
     accountsDomain: (process.env.ZOHO_ACCOUNTS_DOMAIN || 'https://accounts.zoho.eu').replace(/\/$/, ''),
     fixerApiKey: requireEnv('FIXER_API_KEY'),
-    fixerApiBase: (process.env.FIXER_API_BASE || 'http://data.fixer.io/api').replace(/\/$/, ''),
+    fixerApiBase: (process.env.FIXER_API_BASE || 'https://data.fixer.io/api').replace(/\/$/, ''),
 
     dryRun: args['dry-run'] ?? args.dryRun,
     force: args.force ?? false,
@@ -217,7 +218,8 @@ class ZohoClient {
 async function fetchFixerUsdToGbpRate(config) {
   const url = new URL(`${config.fixerApiBase}/latest`);
   url.searchParams.set('access_key', config.fixerApiKey);
-  url.searchParams.set('symbols', 'USD,GBP');
+  url.searchParams.set('base', 'GBP');
+  url.searchParams.set('symbols', 'USD');
 
   const res = await fetch(url);
   const body = await res.json();
@@ -225,22 +227,13 @@ async function fetchFixerUsdToGbpRate(config) {
     throw new Error(`fixer.io API error: ${JSON.stringify(body.error || body)}`);
   }
 
-  const rates = body.rates || {};
-  // The free fixer.io plan always responds with base=EUR regardless of any
-  // requested base, so cross-calculate USD->GBP unless a paid plan already
-  // gave us USD as the base directly.
-  if (body.base === 'USD') {
-    const gbp = toNumber(rates.GBP);
-    if (!gbp) throw new Error('fixer.io response missing GBP rate');
-    return gbp;
+  // rates.USD is "USD per 1 GBP" (base=GBP), so invert it to convert a USD
+  // price into GBP: gbpPrice = usdPrice / usdPerGbp.
+  const usdPerGbp = toNumber((body.rates || {}).USD);
+  if (!usdPerGbp) {
+    throw new Error(`fixer.io response missing USD rate: ${JSON.stringify(body)}`);
   }
-
-  const gbp = toNumber(rates.GBP);
-  const usd = toNumber(rates.USD);
-  if (!gbp || !usd) {
-    throw new Error(`fixer.io response missing USD/GBP rates (base ${body.base}): ${JSON.stringify(body)}`);
-  }
-  return gbp / usd;
+  return 1 / usdPerGbp;
 }
 
 function pickLatestPerItem(records, config, exchangeRate) {
