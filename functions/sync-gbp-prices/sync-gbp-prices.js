@@ -8,6 +8,7 @@
  * Source module: cm_jewellery_item ("Item Attributes")
  *   - cf_jewellery_item                      lookup -> Items module item_id
  *   - cf_sales_price                         Sales Price / Selling PPC (USD)
+ *   - cf_status                              Item status ("Available" / "On Hold")
  *
  * The USD->GBP exchange rate is fetched live from the fixer.io API (one call per
  * run, applied to every record) rather than read from a field on the record.
@@ -15,14 +16,20 @@
  * honors a non-EUR base currency (the free plan ignores `base` and always
  * responds in EUR, which would break this).
  *
- * Target: Items module, field "rate" (the org's base/selling currency is GBP).
+ * Target: Items module
+ *   - "rate" (the org's base/selling currency is GBP)
+ *   - custom field "cf_status" (written via the custom_fields array, since Zoho
+ *     Inventory's Items API exposes custom fields that way rather than as flat
+ *     top-level properties)
  *
  * For each Item Attribute record:
  *   gbp_price = round_to_nearest(usd_price * exchange_rate, ROUND_TO)
  * i.e. the raw converted price is rounded to the nearest multiple of ROUND_TO
  * (default: 5, so sales prices land on whole £5 steps: 5, 10, 15, ...), and that
  * value is written to the linked item's `rate` field, unless it already matches
- * (skip) or --dry-run is set (report only).
+ * (skip) or --dry-run is set (report only). The record's status field is copied
+ * across the same way, but only when its value is one of ITEM_STATUS_VALUES -
+ * anything else is left untouched on the item.
  *
  * If more than one Item Attribute record links to the same item, the most recently
  * modified record wins; conflicts are logged.
@@ -46,16 +53,21 @@
  *   ZOHO_API_DOMAIN        Default: https://www.zohoapis.eu   (Henig Diamonds is EU DC)
  *   ZOHO_ACCOUNTS_DOMAIN   Default: https://accounts.zoho.eu
  *   FIXER_API_BASE         Default: https://data.fixer.io/api
+ *   ITEM_STATUS_VALUES     Comma-separated list of status values that are valid to
+ *                          write to the item's status field. Default: "Available,On Hold".
+ *                          Add more values here (e.g. "Available,On Hold,Reserved")
+ *                          without any code change.
  *
  * CLI usage:
  *   node scripts/sync-gbp-prices.js [--dry-run] [--force]
  *     [--module=cm_jewellery_item]
  *     [--lookup-field=cf_jewellery_item]
  *     [--price-field=cf_sales_price]
+ *     [--status-field=cf_status]
  *     [--round-to=5] [--page-size=200] [--delay-ms=250]
  *
  *   --dry-run   Compute and log what would change without writing to Zoho.
- *   --force     Write even when the computed price already matches the item's rate.
+ *   --force     Write even when the computed price/status already match the item.
  *   --round-to  Round the computed GBP sales price to the nearest multiple of this
  *               value (default: 5). Use 0 or 1 to disable rounding to whole pounds.
  *
@@ -101,6 +113,11 @@ function loadConfig() {
     moduleName: args.module || 'cm_jewellery_item',
     lookupField: args['lookup-field'] || 'cf_jewellery_item',
     priceField: args['price-field'] || 'cf_sales_price',
+    statusField: args['status-field'] || 'cf_status',
+    allowedStatuses: (process.env.ITEM_STATUS_VALUES || 'Available,On Hold')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
     roundTo: Number(args['round-to'] ?? 5),
     pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
@@ -120,6 +137,15 @@ function toNumber(value) {
   if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+// Zoho Inventory's Items API exposes custom fields via a `custom_fields` array
+// ({ api_name, value, ... }) rather than as flat top-level properties.
+function getItemCustomFieldValue(item, apiName) {
+  const fields = item.custom_fields;
+  if (!Array.isArray(fields)) return null;
+  const match = fields.find((f) => f.api_name === apiName);
+  return match ? match.value : null;
 }
 
 class ZohoClient {
@@ -210,10 +236,10 @@ class ZohoClient {
     return json.item;
   }
 
-  async updateItemRate(itemId, name, rate) {
+  async updateItem(itemId, body) {
     return this.request(`items/${itemId}`, {
       method: 'PUT',
-      body: { name, rate },
+      body,
     });
   }
 }
@@ -249,6 +275,16 @@ function pickLatestPerItem(records, config, exchangeRate) {
     if (usdPrice === null || usdPrice <= 0) continue;
 
     const gbpPrice = roundToNearest(usdPrice * exchangeRate, config.roundTo);
+
+    const rawStatus = record[config.statusField];
+    const status = config.allowedStatuses.includes(rawStatus) ? rawStatus : null;
+    if (rawStatus && status === null) {
+      console.warn(
+        `[status] record ${record.module_record_id} has status "${rawStatus}", ` +
+        `which is not in ITEM_STATUS_VALUES (${config.allowedStatuses.join(', ')}); leaving item status untouched.`
+      );
+    }
+
     const candidate = {
       itemId,
       recordId: record.module_record_id,
@@ -256,6 +292,7 @@ function pickLatestPerItem(records, config, exchangeRate) {
       usdPrice,
       exchangeRate,
       gbpPrice,
+      status,
       lastModified: record.last_modified_time || record.created_time || '',
     };
 
@@ -313,11 +350,16 @@ async function main() {
     }
 
     const currentRate = toNumber(item.rate) ?? 0;
-    const unchanged = !config.force && Math.abs(currentRate - update.gbpPrice) < 0.005;
+    const currentStatus = getItemCustomFieldValue(item, config.statusField);
+
+    const rateUnchanged = Math.abs(currentRate - update.gbpPrice) < 0.005;
+    const statusUnchanged = update.status === null || update.status === currentStatus;
+    const unchanged = !config.force && rateUnchanged && statusUnchanged;
 
     const line =
       `item ${update.itemId} (${item.name}): USD ${update.usdPrice} x ${update.exchangeRate} ` +
-      `= £${update.gbpPrice} (current £${currentRate})`;
+      `= £${update.gbpPrice} (current £${currentRate})` +
+      (update.status !== null ? `, status "${currentStatus ?? '(unset)'}" -> "${update.status}"` : '');
 
     if (unchanged) {
       console.log(`[skip:unchanged] ${line}`);
@@ -331,8 +373,13 @@ async function main() {
       continue;
     }
 
+    const body = { name: item.name, rate: update.gbpPrice };
+    if (update.status !== null) {
+      body.custom_fields = [{ api_name: config.statusField, value: update.status }];
+    }
+
     try {
-      await client.updateItemRate(update.itemId, item.name, update.gbpPrice);
+      await client.updateItem(update.itemId, body);
       console.log(`[updated] ${line}`);
       summary.updated += 1;
     } catch (err) {
