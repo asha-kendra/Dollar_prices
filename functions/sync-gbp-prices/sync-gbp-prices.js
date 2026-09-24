@@ -8,7 +8,6 @@
  * Source module: cm_jewellery_item ("Item Attributes")
  *   - cf_jewellery_item                      lookup -> Items module item_id
  *   - cf_sales_price                         Sales Price / Selling PPC (USD)
- *   - cf_status                              Item status ("Available" / "On Hold")
  *
  * The USD->GBP exchange rate is fetched live from the fixer.io API (one call per
  * run, applied to every record) rather than read from a field on the record.
@@ -16,22 +15,22 @@
  * honors a non-EUR base currency (the free plan ignores `base` and always
  * responds in EUR, which would break this).
  *
- * Target: Items module
- *   - "rate" (the org's base/selling currency is GBP)
- *   - custom field "cf_status" (written via the custom_fields array, since Zoho
- *     Inventory's Items API exposes custom fields that way rather than as flat
- *     top-level properties)
+ * Target: Items module, field "rate" (the org's base/selling currency is GBP).
  *
- * For each Item Attribute record:
+ * Only items whose CURRENT `cf_status` custom field (read from the Items module
+ * itself, not from cm_jewellery_item) is one of ITEM_STATUS_VALUES are repriced -
+ * e.g. "Sold", "Rejected", "Faulty" etc. items are left alone even if a matching
+ * Item Attribute record exists for them. cf_status is purely a filter here; this
+ * script never writes it.
+ *
+ * For each Item Attribute record whose linked item passes that status filter:
  *   gbp_price = round_to_nearest(usd_price * exchange_rate, ROUND_TO)
  * i.e. the raw converted price is rounded to the nearest multiple of ROUND_TO
  * (default: 5, so sales prices land on whole £5 steps: 5, 10, 15, ...), and that
  * value is written to the linked item's `rate` field EVERY run - the current
  * value is never compared/skipped, since this is meant to run daily against a
  * live exchange rate that can genuinely round back to the same GBP price. Use
- * --dry-run to preview without writing. The record's status field is copied
- * across the same way, but only when its value is one of ITEM_STATUS_VALUES -
- * anything else is left untouched on the item.
+ * --dry-run to preview without writing.
  *
  * If more than one Item Attribute record links to the same item, the most recently
  * modified record wins; conflicts are logged.
@@ -55,10 +54,11 @@
  *   ZOHO_API_DOMAIN        Default: https://www.zohoapis.eu   (Henig Diamonds is EU DC)
  *   ZOHO_ACCOUNTS_DOMAIN   Default: https://accounts.zoho.eu
  *   FIXER_API_BASE         Default: https://data.fixer.io/api
- *   ITEM_STATUS_VALUES     Comma-separated list of status values that are valid to
- *                          write to the item's status field. Default: "Available,On Hold".
- *                          Add more values here (e.g. "Available,On Hold,Reserved")
- *                          without any code change.
+ *   ITEM_STATUS_VALUES     Comma-separated list of item cf_status values that are
+ *                          eligible for a price update. Default: "Available,On Hold".
+ *                          Items with any other status (or no status set) are
+ *                          skipped. Add more values here (e.g. "Available,On Hold,
+ *                          Reserved") without any code change.
  *
  * CLI usage:
  *   node scripts/sync-gbp-prices.js [--dry-run]
@@ -68,9 +68,12 @@
  *     [--status-field=cf_status]
  *     [--round-to=5] [--page-size=200] [--delay-ms=250]
  *
- *   --dry-run   Compute and log what would change without writing to Zoho.
- *   --round-to  Round the computed GBP sales price to the nearest multiple of this
- *               value (default: 5). Use 0 or 1 to disable rounding to whole pounds.
+ *   --dry-run      Compute and log what would change without writing to Zoho.
+ *   --status-field Items-module custom field read to decide whether an item is
+ *                  eligible for repricing (see ITEM_STATUS_VALUES above).
+ *   --round-to     Round the computed GBP sales price to the nearest multiple of
+ *                  this value (default: 5). Use 0 or 1 to disable rounding to
+ *                  whole pounds.
  *
  * Requires Node.js 18+ (built-in fetch).
  * ---------------------------------------------------------------------------
@@ -275,15 +278,6 @@ function pickLatestPerItem(records, config, exchangeRate) {
 
     const gbpPrice = roundToNearest(usdPrice * exchangeRate, config.roundTo);
 
-    const rawStatus = record[config.statusField];
-    const status = config.allowedStatuses.includes(rawStatus) ? rawStatus : null;
-    if (rawStatus && status === null) {
-      console.warn(
-        `[status] record ${record.module_record_id} has status "${rawStatus}", ` +
-        `which is not in ITEM_STATUS_VALUES (${config.allowedStatuses.join(', ')}); leaving item status untouched.`
-      );
-    }
-
     const candidate = {
       itemId,
       recordId: record.module_record_id,
@@ -291,7 +285,6 @@ function pickLatestPerItem(records, config, exchangeRate) {
       usdPrice,
       exchangeRate,
       gbpPrice,
-      status,
       lastModified: record.last_modified_time || record.created_time || '',
     };
 
@@ -333,6 +326,7 @@ async function main() {
     exchangeRate,
     scanned: updatesByItem.size,
     updated: 0,
+    skippedStatus: 0,
     skippedItemMissing: 0,
     errors: 0,
   };
@@ -347,13 +341,20 @@ async function main() {
       continue;
     }
 
-    const currentRate = toNumber(item.rate) ?? 0;
     const currentStatus = getItemCustomFieldValue(item, config.statusField);
+    if (!config.allowedStatuses.includes(currentStatus)) {
+      console.log(
+        `[skip:status] item ${update.itemId} (${item.name}) has status "${currentStatus ?? '(unset)'}", ` +
+        `which is not in ITEM_STATUS_VALUES (${config.allowedStatuses.join(', ')}); not repricing.`
+      );
+      summary.skippedStatus += 1;
+      continue;
+    }
 
+    const currentRate = toNumber(item.rate) ?? 0;
     const line =
       `item ${update.itemId} (${item.name}): USD ${update.usdPrice} x ${update.exchangeRate} ` +
-      `= £${update.gbpPrice} (current £${currentRate})` +
-      (update.status !== null ? `, status "${currentStatus ?? '(unset)'}" -> "${update.status}"` : '');
+      `= £${update.gbpPrice} (current £${currentRate}, status "${currentStatus}")`;
 
     if (config.dryRun) {
       console.log(`[dry-run] would update ${line}`);
@@ -362,9 +363,6 @@ async function main() {
     }
 
     const body = { name: item.name, rate: update.gbpPrice };
-    if (update.status !== null) {
-      body.custom_fields = [{ api_name: config.statusField, value: update.status }];
-    }
 
     try {
       await client.updateItem(update.itemId, body);
