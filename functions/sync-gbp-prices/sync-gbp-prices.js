@@ -26,8 +26,10 @@
  *   gbp_price = round_to_nearest(usd_price * exchange_rate, ROUND_TO)
  * i.e. the raw converted price is rounded to the nearest multiple of ROUND_TO
  * (default: 5, so sales prices land on whole £5 steps: 5, 10, 15, ...), and that
- * value is written to the linked item's `rate` field, unless it already matches
- * (skip) or --dry-run is set (report only). The record's status field is copied
+ * value is written to the linked item's `rate` field EVERY run - the current
+ * value is never compared/skipped, since this is meant to run daily against a
+ * live exchange rate that can genuinely round back to the same GBP price. Use
+ * --dry-run to preview without writing. The record's status field is copied
  * across the same way, but only when its value is one of ITEM_STATUS_VALUES -
  * anything else is left untouched on the item.
  *
@@ -59,7 +61,7 @@
  *                          without any code change.
  *
  * CLI usage:
- *   node scripts/sync-gbp-prices.js [--dry-run] [--force]
+ *   node scripts/sync-gbp-prices.js [--dry-run]
  *     [--module=cm_jewellery_item]
  *     [--lookup-field=cf_jewellery_item]
  *     [--price-field=cf_sales_price]
@@ -67,7 +69,6 @@
  *     [--round-to=5] [--page-size=200] [--delay-ms=250]
  *
  *   --dry-run   Compute and log what would change without writing to Zoho.
- *   --force     Write even when the computed price/status already match the item.
  *   --round-to  Round the computed GBP sales price to the nearest multiple of this
  *               value (default: 5). Use 0 or 1 to disable rounding to whole pounds.
  *
@@ -78,10 +79,9 @@
 'use strict';
 
 function parseArgs(argv) {
-  const args = { dryRun: false, force: false };
+  const args = { dryRun: false };
   for (const raw of argv) {
     if (raw === '--dry-run') { args.dryRun = true; continue; }
-    if (raw === '--force') { args.force = true; continue; }
     const match = /^--([a-z-]+)=(.*)$/.exec(raw);
     if (match) args[match[1]] = match[2];
   }
@@ -109,7 +109,6 @@ function loadConfig() {
     fixerApiBase: (process.env.FIXER_API_BASE || 'https://data.fixer.io/api').replace(/\/$/, ''),
 
     dryRun: args['dry-run'] ?? args.dryRun,
-    force: args.force ?? false,
     moduleName: args.module || 'cm_jewellery_item',
     lookupField: args['lookup-field'] || 'cf_jewellery_item',
     priceField: args['price-field'] || 'cf_sales_price',
@@ -334,7 +333,6 @@ async function main() {
     exchangeRate,
     scanned: updatesByItem.size,
     updated: 0,
-    skippedUnchanged: 0,
     skippedItemMissing: 0,
     errors: 0,
   };
@@ -352,20 +350,10 @@ async function main() {
     const currentRate = toNumber(item.rate) ?? 0;
     const currentStatus = getItemCustomFieldValue(item, config.statusField);
 
-    const rateUnchanged = Math.abs(currentRate - update.gbpPrice) < 0.005;
-    const statusUnchanged = update.status === null || update.status === currentStatus;
-    const unchanged = !config.force && rateUnchanged && statusUnchanged;
-
     const line =
       `item ${update.itemId} (${item.name}): USD ${update.usdPrice} x ${update.exchangeRate} ` +
       `= £${update.gbpPrice} (current £${currentRate})` +
       (update.status !== null ? `, status "${currentStatus ?? '(unset)'}" -> "${update.status}"` : '');
-
-    if (unchanged) {
-      console.log(`[skip:unchanged] ${line}`);
-      summary.skippedUnchanged += 1;
-      continue;
-    }
 
     if (config.dryRun) {
       console.log(`[dry-run] would update ${line}`);
