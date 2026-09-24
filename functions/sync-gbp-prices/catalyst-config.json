@@ -1,11 +1,1 @@
-{
-  "deployment": {
-    "name": "syncgbpprices",
-    "stack": "node18",
-    "type": "advancedio",
-    "env_variables": {}
-  },
-  "execution": {
-    "main": "index.js"
-  }
-}
+{"execution":{"main":"index.js"},"deployment":{"stack":"node24","name":"CalGBPbasedonDollarRate","type":"advancedio"}}
