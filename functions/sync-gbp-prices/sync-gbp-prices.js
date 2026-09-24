@@ -57,7 +57,9 @@
  *   ZOHO_API_DOMAIN        Default: https://www.zohoapis.eu   (Henig Diamonds is EU DC)
  *   ZOHO_ACCOUNTS_DOMAIN   Default: https://accounts.zoho.eu
  *   FIXER_API_BASE         Default: https://data.fixer.io/api
- *   ITEM_STATUS_VALUES     Comma-separated list of item cf_status values that are
+ *   ITEM_STATUS_FIELD      Items-module custom field API name read to decide whether
+ *                          an item is eligible for repricing. Default: "cf_status".
+ *   ITEM_STATUS_VALUES     Comma-separated list of ITEM_STATUS_FIELD values that are
  *                          eligible for a price update. Default: "Available,On Hold".
  *                          Items with any other status (or no status set) are
  *                          skipped. Add more values here (e.g. "Available,On Hold,
@@ -72,8 +74,8 @@
  *     [--round-to=5] [--page-size=200] [--delay-ms=250]
  *
  *   --dry-run      Compute and log what would change without writing to Zoho.
- *   --status-field Items-module custom field read to decide whether an item is
- *                  eligible for repricing (see ITEM_STATUS_VALUES above).
+ *   --status-field Same as ITEM_STATUS_FIELD above; this flag takes precedence
+ *                  over the env var when both are set.
  *   --round-to     Round the computed GBP sales price to the nearest multiple of
  *                  this value (default: 5). Use 0 or 1 to disable rounding to
  *                  whole pounds.
@@ -118,7 +120,7 @@ function loadConfig() {
     moduleName: args.module || 'cm_jewellery_item',
     lookupField: args['lookup-field'] || 'cf_jewellery_item',
     priceField: args['price-field'] || 'cf_sales_price',
-    statusField: args['status-field'] || 'cf_status',
+    statusField: args['status-field'] || process.env.ITEM_STATUS_FIELD || 'cf_status',
     allowedStatuses: (process.env.ITEM_STATUS_VALUES || 'Available,On Hold')
       .split(',')
       .map((s) => s.trim())
