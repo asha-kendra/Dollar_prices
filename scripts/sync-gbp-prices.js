@@ -9,10 +9,9 @@
  * Source module: cm_jewellery_item ("Item Attributes")
  *   - cf_jewellery_item                      lookup -> Items module item_id
  *   - cf_sales_price                         Sales Price / Selling PPC (USD)
- *   - cf_current_exchange_rate_dollar_to_gbp Current Exchange Rate (Dollar to GBP)
- *   - cf_currency_ex_rate_dollar_to_gbp      Currency Ex Rate (Dollar to GBP) - Import
- *                                             (used as a fallback if the "current" rate
- *                                             field is blank on a record)
+ *
+ * The USD->GBP exchange rate is fetched live from the fixer.io API (one call per
+ * run, applied to every record) rather than read from a field on the record.
  *
  * Target: Items module, field "rate" (the org's base/selling currency is GBP).
  *
@@ -34,18 +33,21 @@
  *   ZOHO_REFRESH_TOKEN     Refresh token issued with scopes covering
  *                          ZohoInventory.items.READ, ZohoInventory.items.UPDATE and
  *                          the custom-module read scope for cm_jewellery_item.
+ *   FIXER_API_KEY          API key from https://fixer.io used to fetch the live
+ *                          USD->GBP exchange rate.
  *
  * Optional environment variables:
  *   ZOHO_API_DOMAIN        Default: https://www.zohoapis.eu   (Henig Diamonds is EU DC)
  *   ZOHO_ACCOUNTS_DOMAIN   Default: https://accounts.zoho.eu
+ *   FIXER_API_BASE         Default: http://data.fixer.io/api   (the free fixer.io plan
+ *                          only supports plain HTTP; use https://data.fixer.io/api if
+ *                          your plan includes HTTPS)
  *
  * Usage:
  *   node scripts/sync-gbp-prices.js [--dry-run] [--force]
  *     [--module=cm_jewellery_item]
  *     [--lookup-field=cf_jewellery_item]
  *     [--price-field=cf_sales_price]
- *     [--rate-field=cf_current_exchange_rate_dollar_to_gbp]
- *     [--fallback-rate-field=cf_currency_ex_rate_dollar_to_gbp]
  *     [--round-to=5] [--page-size=200] [--delay-ms=250]
  *
  *   --dry-run   Compute and log what would change without writing to Zoho.
@@ -87,14 +89,14 @@ function loadConfig() {
     refreshToken: requireEnv('ZOHO_REFRESH_TOKEN'),
     apiDomain: (process.env.ZOHO_API_DOMAIN || 'https://www.zohoapis.eu').replace(/\/$/, ''),
     accountsDomain: (process.env.ZOHO_ACCOUNTS_DOMAIN || 'https://accounts.zoho.eu').replace(/\/$/, ''),
+    fixerApiKey: requireEnv('FIXER_API_KEY'),
+    fixerApiBase: (process.env.FIXER_API_BASE || 'http://data.fixer.io/api').replace(/\/$/, ''),
 
     dryRun: args['dry-run'] ?? args.dryRun,
     force: args.force ?? false,
     moduleName: args.module || 'cm_jewellery_item',
     lookupField: args['lookup-field'] || 'cf_jewellery_item',
     priceField: args['price-field'] || 'cf_sales_price',
-    rateField: args['rate-field'] || 'cf_current_exchange_rate_dollar_to_gbp',
-    fallbackRateField: args['fallback-rate-field'] || 'cf_currency_ex_rate_dollar_to_gbp',
     roundTo: Number(args['round-to'] ?? 5),
     pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
@@ -212,23 +214,43 @@ class ZohoClient {
   }
 }
 
-function resolveExchangeRate(record, config) {
-  const primary = toNumber(record[config.rateField]);
-  if (primary && primary > 0) return primary;
-  const fallback = toNumber(record[config.fallbackRateField]);
-  if (fallback && fallback > 0) return fallback;
-  return null;
+async function fetchFixerUsdToGbpRate(config) {
+  const url = new URL(`${config.fixerApiBase}/latest`);
+  url.searchParams.set('access_key', config.fixerApiKey);
+  url.searchParams.set('symbols', 'USD,GBP');
+
+  const res = await fetch(url);
+  const body = await res.json();
+  if (!res.ok || !body.success) {
+    throw new Error(`fixer.io API error: ${JSON.stringify(body.error || body)}`);
+  }
+
+  const rates = body.rates || {};
+  // The free fixer.io plan always responds with base=EUR regardless of any
+  // requested base, so cross-calculate USD->GBP unless a paid plan already
+  // gave us USD as the base directly.
+  if (body.base === 'USD') {
+    const gbp = toNumber(rates.GBP);
+    if (!gbp) throw new Error('fixer.io response missing GBP rate');
+    return gbp;
+  }
+
+  const gbp = toNumber(rates.GBP);
+  const usd = toNumber(rates.USD);
+  if (!gbp || !usd) {
+    throw new Error(`fixer.io response missing USD/GBP rates (base ${body.base}): ${JSON.stringify(body)}`);
+  }
+  return gbp / usd;
 }
 
-function pickLatestPerItem(records, config) {
+function pickLatestPerItem(records, config, exchangeRate) {
   const byItem = new Map();
   for (const record of records) {
     const itemId = record[config.lookupField];
     if (!itemId) continue;
 
     const usdPrice = toNumber(record[config.priceField]);
-    const exchangeRate = resolveExchangeRate(record, config);
-    if (usdPrice === null || usdPrice <= 0 || exchangeRate === null) continue;
+    if (usdPrice === null || usdPrice <= 0) continue;
 
     const gbpPrice = roundToNearest(usdPrice * exchangeRate, config.roundTo);
     const candidate = {
@@ -263,14 +285,16 @@ async function main() {
   const config = loadConfig();
   const client = new ZohoClient(config);
 
+  const exchangeRate = await fetchFixerUsdToGbpRate(config);
+  console.log(`Live USD->GBP exchange rate from fixer.io: ${exchangeRate}`);
+
   console.log(
-    `Fetching "${config.moduleName}" records ` +
-    `(price field: ${config.priceField}, rate field: ${config.rateField})...`
+    `Fetching "${config.moduleName}" records (price field: ${config.priceField})...`
   );
   const records = await client.listAllCustomModuleRecords(config.moduleName, config.pageSize);
   console.log(`Fetched ${records.length} record(s).`);
 
-  const updatesByItem = pickLatestPerItem(records, config);
+  const updatesByItem = pickLatestPerItem(records, config, exchangeRate);
   console.log(`${updatesByItem.size} distinct item(s) have a computable GBP price.`);
 
   const summary = {
