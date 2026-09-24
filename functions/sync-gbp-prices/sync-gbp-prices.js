@@ -17,20 +17,23 @@
  *
  * Target: Items module, field "rate" (the org's base/selling currency is GBP).
  *
- * Only items whose CURRENT `cf_status` custom field (read from the Items module
- * itself, not from cm_jewellery_item) is one of ITEM_STATUS_VALUES are repriced -
- * e.g. "Sold", "Rejected", "Faulty" etc. items are left alone even if a matching
- * Item Attribute record exists for them. cf_status is purely a filter here; this
- * script never writes it.
- *
- * For each Item Attribute record whose linked item passes that status filter:
- *   gbp_price = round_to_nearest(usd_price * exchange_rate, ROUND_TO)
- * i.e. the raw converted price is rounded to the nearest multiple of ROUND_TO
- * (default: 5, so sales prices land on whole £5 steps: 5, 10, 15, ...), and that
- * value is written to the linked item's `rate` field EVERY run - the current
- * value is never compared/skipped, since this is meant to run daily against a
- * live exchange rate that can genuinely round back to the same GBP price. Use
- * --dry-run to preview without writing.
+ * Steps, in order:
+ *   1. Fetch items whose CURRENT `cf_status` custom field is one of
+ *      ITEM_STATUS_VALUES, using cf_status as a direct server-side search filter
+ *      on the Items list endpoint (bulk, paginated - no per-item GET calls).
+ *      This also gives us each eligible item's current name/rate. cf_status is
+ *      purely a filter here; this script never writes it. Items with any other
+ *      status (Sold, Rejected, Faulty, etc.) or no status set are never touched.
+ *   2. Fetch the USD sales price for each item from the linked cm_jewellery_item
+ *      ("Item Attributes") record.
+ *   3. Compute gbp_price = round_to_nearest(usd_price * exchange_rate, ROUND_TO)
+ *      i.e. the raw converted price rounded to the nearest multiple of ROUND_TO
+ *      (default: 5, so sales prices land on whole £5 steps: 5, 10, 15, ...).
+ *   4. Write gbp_price to the item's `rate` field in the Items module - only for
+ *      items that passed the status filter in step 1. Written EVERY run; the
+ *      current value is never compared/skipped, since this runs daily against a
+ *      live exchange rate that can genuinely round back to the same GBP price.
+ *      Use --dry-run to preview without writing.
  *
  * If more than one Item Attribute record links to the same item, the most recently
  * modified record wins; conflicts are logged.
@@ -141,15 +144,6 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-// Zoho Inventory's Items API exposes custom fields via a `custom_fields` array
-// ({ api_name, value, ... }) rather than as flat top-level properties.
-function getItemCustomFieldValue(item, apiName) {
-  const fields = item.custom_fields;
-  if (!Array.isArray(fields)) return null;
-  const match = fields.find((f) => f.api_name === apiName);
-  return match ? match.value : null;
-}
-
 class ZohoClient {
   constructor(config) {
     this.config = config;
@@ -233,9 +227,21 @@ class ZohoClient {
     return records;
   }
 
-  async getItem(itemId) {
-    const json = await this.request(`items/${itemId}`);
-    return json.item;
+  async listItemsByStatus(statusField, statusValue, perPage) {
+    const items = [];
+    let page = 1;
+    for (;;) {
+      const json = await this.request('items', {
+        query: { page, per_page: perPage, [statusField]: statusValue },
+      });
+      const pageItems = json.items || [];
+      items.push(...pageItems);
+      const hasMore = json.page_context && json.page_context.has_more_page;
+      if (!hasMore) break;
+      page += 1;
+      await sleep(this.config.delayMs);
+    }
+    return items;
   }
 
   async updateItem(itemId, body) {
@@ -310,51 +316,57 @@ async function main() {
   const config = loadConfig();
   const client = new ZohoClient(config);
 
-  const exchangeRate = await fetchFixerUsdToGbpRate(config);
-  console.log(`Live USD->GBP exchange rate from fixer.io: ${exchangeRate}`);
+  // Step 1: fetch items based on status (bulk, paginated - gives us each
+  // eligible item's current name/rate too, so no per-item GET is needed later).
+  console.log(
+    `Fetching items with ${config.statusField} in [${config.allowedStatuses.join(', ')}]...`
+  );
+  const eligibleItems = new Map();
+  for (const status of config.allowedStatuses) {
+    const items = await client.listItemsByStatus(config.statusField, status, config.pageSize);
+    console.log(`  ${status}: ${items.length} item(s)`);
+    for (const item of items) {
+      eligibleItems.set(item.item_id, { name: item.name, rate: toNumber(item.rate) ?? 0, status });
+    }
+  }
+  console.log(`${eligibleItems.size} eligible item(s) total.`);
 
+  // Step 2: get the USD ("dollar") price for each item from the linked
+  // cm_jewellery_item ("Item Attributes") record.
   console.log(
     `Fetching "${config.moduleName}" records (price field: ${config.priceField})...`
   );
   const records = await client.listAllCustomModuleRecords(config.moduleName, config.pageSize);
   console.log(`Fetched ${records.length} record(s).`);
 
+  // Step 3: compute the GBP price for each item (also resolves conflicts when
+  // more than one record links to the same item).
+  const exchangeRate = await fetchFixerUsdToGbpRate(config);
+  console.log(`Live USD->GBP exchange rate from fixer.io: ${exchangeRate}`);
   const updatesByItem = pickLatestPerItem(records, config, exchangeRate);
   console.log(`${updatesByItem.size} distinct item(s) have a computable GBP price.`);
 
   const summary = {
     exchangeRate,
+    eligibleItems: eligibleItems.size,
     scanned: updatesByItem.size,
     updated: 0,
-    skippedStatus: 0,
-    skippedItemMissing: 0,
+    skippedNotEligible: 0,
     errors: 0,
   };
 
+  // Step 4: update the rate in the Items module, only for items that passed
+  // the status filter in step 1.
   for (const update of updatesByItem.values()) {
-    let item;
-    try {
-      item = await client.getItem(update.itemId);
-    } catch (err) {
-      console.error(`[error] could not fetch item ${update.itemId}: ${err.message}`);
-      summary.skippedItemMissing += 1;
+    const item = eligibleItems.get(update.itemId);
+    if (!item) {
+      summary.skippedNotEligible += 1;
       continue;
     }
 
-    const currentStatus = getItemCustomFieldValue(item, config.statusField);
-    if (!config.allowedStatuses.includes(currentStatus)) {
-      console.log(
-        `[skip:status] item ${update.itemId} (${item.name}) has status "${currentStatus ?? '(unset)'}", ` +
-        `which is not in ITEM_STATUS_VALUES (${config.allowedStatuses.join(', ')}); not repricing.`
-      );
-      summary.skippedStatus += 1;
-      continue;
-    }
-
-    const currentRate = toNumber(item.rate) ?? 0;
     const line =
       `item ${update.itemId} (${item.name}): USD ${update.usdPrice} x ${update.exchangeRate} ` +
-      `= £${update.gbpPrice} (current £${currentRate}, status "${currentStatus}")`;
+      `= £${update.gbpPrice} (current £${item.rate}, status "${item.status}")`;
 
     if (config.dryRun) {
       console.log(`[dry-run] would update ${line}`);
