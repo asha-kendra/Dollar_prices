@@ -386,6 +386,8 @@ async function main() {
     }
   }
   console.log(`${eligibleItems.size} eligible item(s) total.`);
+  const eligibleSkus = [...eligibleItems.values()].map((i) => i.sku);
+  console.log(`Eligible SKUs: ${eligibleSkus.join(', ') || '(none)'}`);
 
   // Step 2: get the USD ("dollar") price for each item from the linked
   // cm_jewellery_item ("Item Attributes") record. For a --limit run, look up
@@ -395,8 +397,12 @@ async function main() {
   if (config.limit) {
     console.log(`Looking up "${config.moduleName}" records for ${eligibleItems.size} item(s)...`);
     records = [];
-    for (const itemId of eligibleItems.keys()) {
+    for (const [itemId, item] of eligibleItems) {
       const record = await client.findCustomModuleRecordByLookup(config.moduleName, config.lookupField, itemId);
+      console.log(
+        `  SKU ${item.sku} (item ${itemId}): ` +
+        (record ? `record ${record.module_record_id} found, cf_sales_price="${record[config.priceField]}"` : 'NO matching cm_jewellery_item record')
+      );
       if (record) records.push(record);
       await sleep(config.delayMs);
     }
@@ -418,6 +424,7 @@ async function main() {
   const summary = {
     exchangeRate,
     eligibleItems: eligibleItems.size,
+    eligibleSkus,
     scanned: updatesByItem.size,
     updated: 0,
     skippedNotEligible: 0,
