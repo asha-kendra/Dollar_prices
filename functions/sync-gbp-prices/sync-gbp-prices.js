@@ -81,6 +81,14 @@
  *                          record directly (via the lookup field, one call per
  *                          item) instead of bulk-fetching the whole module - the
  *                          summary's updatedSkus lists exactly which SKUs changed.
+ *   CONCURRENCY            How many items' price-lookup/update calls run at once
+ *                          (step 2's per-item lookups when ITEM_LIMIT is set, and
+ *                          step 4's updates always). Default: 10. Serverless
+ *                          functions have a hard execution time limit, and doing
+ *                          hundreds of items one at a time - each a network
+ *                          round trip - can exceed it; running them concurrently
+ *                          instead of serially is what keeps a run inside that
+ *                          budget. Lower this if you hit Zoho rate limits.
  *
  * CLI usage:
  *   node scripts/sync-gbp-prices.js [--dry-run]
@@ -151,6 +159,7 @@ function loadConfig() {
     caratField: args['carat-field'] || process.env.CARAT_FIELD || 'cf_carat_total',
     mainTotalField: args['main-total-field'] || process.env.MAIN_TOTAL_FIELD || 'cf_main_total',
     limit: Number(args.limit ?? process.env.ITEM_LIMIT ?? 0),
+    concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 10),
     roundTo: Number(args['round-to'] ?? 5),
     pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
@@ -159,6 +168,26 @@ function loadConfig() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Runs worker(item) over items with at most `concurrency` in flight at once,
+// preserving each result at its original index. Per-item Zoho calls (price
+// lookups, updates) don't need to be serialized with an artificial delay
+// between them the way page-to-page pagination does - request() already
+// retries on 429 - so running them concurrently is what keeps a run inside a
+// serverless function's execution time limit.
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function runNext() {
+    for (;;) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, runNext));
+  return results;
 }
 
 function roundToNearest(value, multiple) {
@@ -395,17 +424,19 @@ async function main() {
   // module (which could be many thousands of records).
   let records;
   if (config.limit) {
-    console.log(`Looking up "${config.moduleName}" records for ${eligibleItems.size} item(s)...`);
-    records = [];
-    for (const [itemId, item] of eligibleItems) {
+    console.log(
+      `Looking up "${config.moduleName}" records for ${eligibleItems.size} item(s) ` +
+      `(concurrency ${config.concurrency})...`
+    );
+    const found = await mapWithConcurrency([...eligibleItems], config.concurrency, async ([itemId, item]) => {
       const record = await client.findCustomModuleRecordByLookup(config.moduleName, config.lookupField, itemId);
       console.log(
         `  SKU ${item.sku} (item ${itemId}): ` +
         (record ? `record ${record.module_record_id} found, cf_sales_price="${record[config.priceField]}"` : 'NO matching cm_jewellery_item record')
       );
-      if (record) records.push(record);
-      await sleep(config.delayMs);
-    }
+      return record;
+    });
+    records = found.filter(Boolean);
   } else {
     console.log(
       `Fetching "${config.moduleName}" records (price field: ${config.priceField})...`
@@ -433,12 +464,14 @@ async function main() {
   };
 
   // Step 4: update the rate in the Items module, only for items that passed
-  // the status filter in step 1.
-  for (const update of updatesByItem.values()) {
+  // the status filter in step 1. Runs with bounded concurrency (see
+  // mapWithConcurrency) rather than one item at a time, to stay inside a
+  // serverless function's execution time limit.
+  await mapWithConcurrency([...updatesByItem.values()], config.concurrency, async (update) => {
     const item = eligibleItems.get(update.itemId);
     if (!item) {
       summary.skippedNotEligible += 1;
-      continue;
+      return;
     }
 
     // cf_main_total = rate * carat total (confirmed against a live item:
@@ -460,7 +493,7 @@ async function main() {
       console.log(`[dry-run] would update ${line}`);
       summary.updated += 1;
       summary.updatedSkus.push(item.sku);
-      continue;
+      return;
     }
 
     const body = { name: item.name, rate: update.gbpPrice };
@@ -477,9 +510,7 @@ async function main() {
       console.error(`[error] failed to update item ${update.itemId}: ${err.message}`);
       summary.errors += 1;
     }
-
-    await sleep(config.delayMs);
-  }
+  });
 
   console.log('\nSummary:', summary);
   return summary;
