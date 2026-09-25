@@ -74,6 +74,13 @@
  *                          compute cf_main_total. Default: "cf_carat_total".
  *   MAIN_TOTAL_FIELD       Items-module custom field the computed main total is
  *                          written to. Default: "cf_main_total".
+ *   ITEM_LIMIT             Cap on how many eligible items to process, for testing
+ *                          (e.g. "10"). Default: 0 (no limit). When set, step 1
+ *                          stops as soon as this many eligible items are found,
+ *                          and step 2 looks up each one's cm_jewellery_item
+ *                          record directly (via the lookup field, one call per
+ *                          item) instead of bulk-fetching the whole module - the
+ *                          summary's updatedSkus lists exactly which SKUs changed.
  *
  * CLI usage:
  *   node scripts/sync-gbp-prices.js [--dry-run]
@@ -83,6 +90,7 @@
  *     [--status-field=cf_status]
  *     [--carat-field=cf_carat_total]
  *     [--main-total-field=cf_main_total]
+ *     [--limit=10]
  *     [--round-to=5] [--page-size=200] [--delay-ms=250]
  *
  *   --dry-run          Compute and log what would change without writing to Zoho.
@@ -90,6 +98,7 @@
  *                      over the env var when both are set.
  *   --carat-field      Same as CARAT_FIELD above.
  *   --main-total-field Same as MAIN_TOTAL_FIELD above.
+ *   --limit            Same as ITEM_LIMIT above.
  *   --round-to         Round the computed GBP sales price to the nearest multiple of
  *                      this value (default: 5). Use 0 or 1 to disable rounding to
  *                      whole pounds.
@@ -141,6 +150,7 @@ function loadConfig() {
       .filter(Boolean),
     caratField: args['carat-field'] || process.env.CARAT_FIELD || 'cf_carat_total',
     mainTotalField: args['main-total-field'] || process.env.MAIN_TOTAL_FIELD || 'cf_main_total',
+    limit: Number(args.limit ?? process.env.ITEM_LIMIT ?? 0),
     roundTo: Number(args['round-to'] ?? 5),
     pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
@@ -249,7 +259,7 @@ class ZohoClient {
     return records;
   }
 
-  async listItemsByStatus(statusField, statusValue, perPage) {
+  async listItemsByStatus(statusField, statusValue, perPage, limit) {
     const items = [];
     let page = 1;
     for (;;) {
@@ -258,12 +268,25 @@ class ZohoClient {
       });
       const pageItems = json.items || [];
       items.push(...pageItems);
+      if (limit && items.length >= limit) return items.slice(0, limit);
       const hasMore = json.page_context && json.page_context.has_more_page;
       if (!hasMore) break;
       page += 1;
       await sleep(this.config.delayMs);
     }
     return items;
+  }
+
+  // Looks up the single most-recently-modified custom module record whose
+  // lookup field matches lookupValue, via the same direct field filter used
+  // for cf_status. Used for --limit runs so we don't have to bulk-fetch the
+  // whole module just to find a handful of specific items' records.
+  async findCustomModuleRecordByLookup(moduleName, lookupField, lookupValue) {
+    const json = await this.request(moduleName, {
+      query: { per_page: 1, [lookupField]: lookupValue, sort_column: 'last_modified_time', sort_order: 'D' },
+    });
+    const records = json.module_records || json[moduleName] || [];
+    return records[0] || null;
   }
 
   async updateItem(itemId, body) {
@@ -340,16 +363,22 @@ async function main() {
 
   // Step 1: fetch items based on status (bulk, paginated - gives us each
   // eligible item's current name/rate too, so no per-item GET is needed later).
+  // When --limit is set, stop as soon as that many eligible items are found.
   console.log(
-    `Fetching items with ${config.statusField} in [${config.allowedStatuses.join(', ')}]...`
+    `Fetching items with ${config.statusField} in [${config.allowedStatuses.join(', ')}]` +
+    (config.limit ? ` (limit ${config.limit})` : '') + '...'
   );
   const eligibleItems = new Map();
   for (const status of config.allowedStatuses) {
-    const items = await client.listItemsByStatus(config.statusField, status, config.pageSize);
+    if (config.limit && eligibleItems.size >= config.limit) break;
+    const remaining = config.limit ? config.limit - eligibleItems.size : 0;
+    const items = await client.listItemsByStatus(config.statusField, status, config.pageSize, remaining);
     console.log(`  ${status}: ${items.length} item(s)`);
     for (const item of items) {
+      if (config.limit && eligibleItems.size >= config.limit) break;
       eligibleItems.set(item.item_id, {
         name: item.name,
+        sku: item.sku,
         rate: toNumber(item.rate) ?? 0,
         status,
         caratTotal: toNumber(item[config.caratField]),
@@ -359,11 +388,24 @@ async function main() {
   console.log(`${eligibleItems.size} eligible item(s) total.`);
 
   // Step 2: get the USD ("dollar") price for each item from the linked
-  // cm_jewellery_item ("Item Attributes") record.
-  console.log(
-    `Fetching "${config.moduleName}" records (price field: ${config.priceField})...`
-  );
-  const records = await client.listAllCustomModuleRecords(config.moduleName, config.pageSize);
+  // cm_jewellery_item ("Item Attributes") record. For a --limit run, look up
+  // each eligible item's record directly instead of bulk-fetching the whole
+  // module (which could be many thousands of records).
+  let records;
+  if (config.limit) {
+    console.log(`Looking up "${config.moduleName}" records for ${eligibleItems.size} item(s)...`);
+    records = [];
+    for (const itemId of eligibleItems.keys()) {
+      const record = await client.findCustomModuleRecordByLookup(config.moduleName, config.lookupField, itemId);
+      if (record) records.push(record);
+      await sleep(config.delayMs);
+    }
+  } else {
+    console.log(
+      `Fetching "${config.moduleName}" records (price field: ${config.priceField})...`
+    );
+    records = await client.listAllCustomModuleRecords(config.moduleName, config.pageSize);
+  }
   console.log(`Fetched ${records.length} record(s).`);
 
   // Step 3: compute the GBP price for each item (also resolves conflicts when
@@ -380,6 +422,7 @@ async function main() {
     updated: 0,
     skippedNotEligible: 0,
     errors: 0,
+    updatedSkus: [],
   };
 
   // Step 4: update the rate in the Items module, only for items that passed
@@ -402,13 +445,14 @@ async function main() {
     }
 
     const line =
-      `item ${update.itemId} (${item.name}): USD ${update.usdPrice} x ${update.exchangeRate} ` +
+      `item ${update.itemId} (${item.name}, SKU ${item.sku}): USD ${update.usdPrice} x ${update.exchangeRate} ` +
       `= £${update.gbpPrice} (current £${item.rate}, status "${item.status}")` +
       (mainTotal !== null ? `, ${config.mainTotalField} -> £${mainTotal}` : '');
 
     if (config.dryRun) {
       console.log(`[dry-run] would update ${line}`);
       summary.updated += 1;
+      summary.updatedSkus.push(item.sku);
       continue;
     }
 
@@ -421,6 +465,7 @@ async function main() {
       await client.updateItem(update.itemId, body);
       console.log(`[updated] ${line}`);
       summary.updated += 1;
+      summary.updatedSkus.push(item.sku);
     } catch (err) {
       console.error(`[error] failed to update item ${update.itemId}: ${err.message}`);
       summary.errors += 1;
