@@ -19,6 +19,10 @@
  *   - "rate" (the org's base/selling currency is GBP)
  *   - custom field cf_main_total = rate * cf_carat_total (confirmed against a
  *     live item: rate 2045 x cf_carat_total 1.01 = cf_main_total 2065.45)
+ * Also writes back to every cm_jewellery_item record used in the conversion:
+ *   - cf_current_exchange_rate_dollar_to_gbp = the live fixer.io rate used this
+ *     run, so the record reflects what rate its price was converted with -
+ *     regardless of whether the linked item passed the status filter below.
  *
  * Steps, in order:
  *   1. Fetch items whose CURRENT `cf_status` custom field is one of
@@ -33,7 +37,8 @@
  *   3. Compute gbp_price = round_to_nearest(usd_price * exchange_rate, ROUND_TO)
  *      i.e. the raw converted price rounded to the nearest multiple of ROUND_TO
  *      (default: 5, so sales prices land on whole £5 steps: 5, 10, 15, ...), and
- *      main_total = round_currency(gbp_price * cf_carat_total).
+ *      main_total = round_currency(gbp_price * cf_carat_total). Also writes the
+ *      live exchange rate back onto each cm_jewellery_item record used (see above).
  *   4. Write gbp_price to the item's `rate` field, and main_total to
  *      cf_main_total (skipped if the item has no cf_carat_total), in the Items
  *      module - only for items that passed the status filter in step 1. Written
@@ -74,6 +79,9 @@
  *                          compute cf_main_total. Default: "cf_carat_total".
  *   MAIN_TOTAL_FIELD       Items-module custom field the computed main total is
  *                          written to. Default: "cf_main_total".
+ *   EXCHANGE_RATE_FIELD    cm_jewellery_item custom field the live fixer.io rate is
+ *                          written to on every record used this run. Default:
+ *                          "cf_current_exchange_rate_dollar_to_gbp".
  *   ITEM_LIMIT             Cap on how many eligible items to process, for testing
  *                          (e.g. "10"). Default: 0 (no limit). When set, step 1
  *                          stops as soon as this many eligible items are found,
@@ -103,15 +111,17 @@
  *     [--status-field=cf_status]
  *     [--carat-field=cf_carat_total]
  *     [--main-total-field=cf_main_total]
+ *     [--exchange-rate-field=cf_current_exchange_rate_dollar_to_gbp]
  *     [--limit=10]
  *     [--round-to=5] [--page-size=200] [--delay-ms=250]
  *
- *   --dry-run          Compute and log what would change without writing to Zoho.
- *   --status-field     Same as ITEM_STATUS_FIELD above; this flag takes precedence
- *                      over the env var when both are set.
- *   --carat-field      Same as CARAT_FIELD above.
- *   --main-total-field Same as MAIN_TOTAL_FIELD above.
- *   --limit            Same as ITEM_LIMIT above.
+ *   --dry-run            Compute and log what would change without writing to Zoho.
+ *   --status-field       Same as ITEM_STATUS_FIELD above; this flag takes precedence
+ *                        over the env var when both are set.
+ *   --carat-field        Same as CARAT_FIELD above.
+ *   --main-total-field   Same as MAIN_TOTAL_FIELD above.
+ *   --exchange-rate-field Same as EXCHANGE_RATE_FIELD above.
+ *   --limit              Same as ITEM_LIMIT above.
  *   --round-to         Round the computed GBP sales price to the nearest multiple of
  *                      this value (default: 5). Use 0 or 1 to disable rounding to
  *                      whole pounds.
@@ -163,6 +173,7 @@ function loadConfig() {
       .filter(Boolean),
     caratField: args['carat-field'] || process.env.CARAT_FIELD || 'cf_carat_total',
     mainTotalField: args['main-total-field'] || process.env.MAIN_TOTAL_FIELD || 'cf_main_total',
+    exchangeRateField: args['exchange-rate-field'] || process.env.EXCHANGE_RATE_FIELD || 'cf_current_exchange_rate_dollar_to_gbp',
     limit: Number(args.limit ?? process.env.ITEM_LIMIT ?? 0),
     // 0 = unbounded: fire every item's call at once and let request()'s 429
     // retry/backoff self-throttle against Zoho's rate limits, rather than
@@ -334,6 +345,13 @@ class ZohoClient {
       body,
     });
   }
+
+  async updateCustomModuleRecord(moduleName, recordId, body) {
+    return this.request(`${moduleName}/${recordId}`, {
+      method: 'PUT',
+      body,
+    });
+  }
 }
 
 async function fetchFixerUsdToGbpRate(config) {
@@ -471,7 +489,31 @@ async function main() {
     skippedNotEligible: 0,
     errors: 0,
     updatedSkus: [],
+    exchangeRateRecordsUpdated: 0,
+    exchangeRateRecordErrors: 0,
   };
+
+  // Step 3b: write the live exchange rate back onto every cm_jewellery_item
+  // record used above, regardless of the linked item's status eligibility -
+  // it documents what rate this record's price was last converted with. Runs
+  // independently of (and concurrently with) step 4's item updates below.
+  const exchangeRateWrites = mapWithConcurrency([...updatesByItem.values()], config.concurrency, async (update) => {
+    if (config.dryRun) {
+      console.log(`[dry-run] would set ${config.exchangeRateField}=${exchangeRate} on record ${update.recordId}`);
+      summary.exchangeRateRecordsUpdated += 1;
+      return;
+    }
+    try {
+      await client.updateCustomModuleRecord(config.moduleName, update.recordId, {
+        record_name: update.recordName,
+        [config.exchangeRateField]: exchangeRate,
+      });
+      summary.exchangeRateRecordsUpdated += 1;
+    } catch (err) {
+      console.error(`[error] failed to set ${config.exchangeRateField} on record ${update.recordId}: ${err.message}`);
+      summary.exchangeRateRecordErrors += 1;
+    }
+  });
 
   // Step 4: update the rate in the Items module, only for items that passed
   // the status filter in step 1. Runs with bounded concurrency (see
@@ -521,6 +563,8 @@ async function main() {
       summary.errors += 1;
     }
   });
+
+  await exchangeRateWrites;
 
   console.log('\nSummary:', summary);
   return summary;
