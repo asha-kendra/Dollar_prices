@@ -1,1 +1,1 @@
-{"execution":{"main":"index.js"},"deployment":{"stack":"node24","name":"CalGBPbasedonDollarRateCRM","type":"advancedio"}}
+{"execution":{"main":"index.js"},"deployment":{"stack":"node24","name":"crm_dollar_to_GBP","type":"advancedio"}}
