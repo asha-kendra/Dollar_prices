@@ -1,0 +1,12 @@
+{
+  "name": "sync-gbp-prices-crm",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "4.17.1"
+  }
+}
