@@ -83,12 +83,17 @@
  *                          summary's updatedSkus lists exactly which SKUs changed.
  *   CONCURRENCY            How many items' price-lookup/update calls run at once
  *                          (step 2's per-item lookups when ITEM_LIMIT is set, and
- *                          step 4's updates always). Default: 10. Serverless
- *                          functions have a hard execution time limit, and doing
- *                          hundreds of items one at a time - each a network
- *                          round trip - can exceed it; running them concurrently
- *                          instead of serially is what keeps a run inside that
- *                          budget. Lower this if you hit Zoho rate limits.
+ *                          step 4's updates always). Default: 0, meaning
+ *                          unbounded - every item's call fires at once rather
+ *                          than being queued behind a fixed-size window.
+ *                          Serverless functions have a hard execution time
+ *                          limit, and doing hundreds/thousands of items one at
+ *                          a time - each a network round trip - can exceed it;
+ *                          running them all concurrently is what keeps a run
+ *                          inside that budget. request()'s existing 429
+ *                          retry/backoff absorbs Zoho's rate limiting, but set
+ *                          this to a positive number to cap how many run at
+ *                          once if that's not enough.
  *
  * CLI usage:
  *   node scripts/sync-gbp-prices.js [--dry-run]
@@ -159,7 +164,10 @@ function loadConfig() {
     caratField: args['carat-field'] || process.env.CARAT_FIELD || 'cf_carat_total',
     mainTotalField: args['main-total-field'] || process.env.MAIN_TOTAL_FIELD || 'cf_main_total',
     limit: Number(args.limit ?? process.env.ITEM_LIMIT ?? 0),
-    concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 10),
+    // 0 = unbounded: fire every item's call at once and let request()'s 429
+    // retry/backoff self-throttle against Zoho's rate limits, rather than
+    // artificially capping how many run in parallel.
+    concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 0),
     roundTo: Number(args['round-to'] ?? 5),
     pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
@@ -170,12 +178,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Runs worker(item) over items with at most `concurrency` in flight at once,
-// preserving each result at its original index. Per-item Zoho calls (price
-// lookups, updates) don't need to be serialized with an artificial delay
-// between them the way page-to-page pagination does - request() already
-// retries on 429 - so running them concurrently is what keeps a run inside a
-// serverless function's execution time limit.
+// Runs worker(item) over items with at most `concurrency` in flight at once
+// (0 or falsy means unbounded - run every item at once), preserving each
+// result at its original index. Per-item Zoho calls (price lookups, updates)
+// don't need to be serialized with an artificial delay between them the way
+// page-to-page pagination does - request() already retries on 429 - so
+// running them concurrently is what keeps a run inside a serverless
+// function's execution time limit.
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
   let nextIndex = 0;
@@ -186,7 +195,8 @@ async function mapWithConcurrency(items, concurrency, worker) {
       results[index] = await worker(items[index], index);
     }
   }
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, runNext));
+  const workers = concurrency > 0 ? Math.min(concurrency, items.length) : items.length;
+  await Promise.all(Array.from({ length: workers }, runNext));
   return results;
 }
 
@@ -426,7 +436,7 @@ async function main() {
   if (config.limit) {
     console.log(
       `Looking up "${config.moduleName}" records for ${eligibleItems.size} item(s) ` +
-      `(concurrency ${config.concurrency})...`
+      `(concurrency ${config.concurrency || 'unbounded'})...`
     );
     const found = await mapWithConcurrency([...eligibleItems], config.concurrency, async ([itemId, item]) => {
       const record = await client.findCustomModuleRecordByLookup(config.moduleName, config.lookupField, itemId);
