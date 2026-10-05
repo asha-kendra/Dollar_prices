@@ -50,10 +50,15 @@
  *   - functions/sync-gbp-prices-crm/index.js   Zoho Catalyst Advanced I/O handler
  *
  * ---------------------------------------------------------------------------
- * Required environment variables (self-client / server-based Zoho OAuth app):
- *   ZOHO_CRM_CLIENT_ID
- *   ZOHO_CRM_CLIENT_SECRET
- *   ZOHO_CRM_REFRESH_TOKEN     Refresh token issued with scopes covering reading
+ * Required environment variables (self-client / server-based Zoho OAuth app) -
+ * named the same as the Inventory sync's env vars (ZOHO_CLIENT_ID etc., not
+ * ZOHO_CRM_*) since each is a separate Catalyst function with its own isolated
+ * environment, so there's no naming collision to avoid - just set this
+ * function's values to a CRM-scoped client/refresh token, different from the
+ * Inventory function's Zoho Inventory-scoped ones:
+ *   ZOHO_CLIENT_ID
+ *   ZOHO_CLIENT_SECRET
+ *   ZOHO_REFRESH_TOKEN         Refresh token issued with scopes covering reading
  *                              and updating the Products module and running COQL
  *                              queries, e.g.:
  *                                ZohoCRM.modules.products.READ,
@@ -65,9 +70,9 @@
  *                              live USD->GBP exchange rate.
  *
  * Optional environment variables:
- *   ZOHO_CRM_API_DOMAIN        Default: https://www.zohoapis.eu
- *   ZOHO_CRM_ACCOUNTS_DOMAIN   Default: https://accounts.zoho.eu
- *   ZOHO_CRM_API_VERSION       Default: v2
+ *   ZOHO_API_DOMAIN            Default: https://www.zohoapis.eu
+ *   ZOHO_ACCOUNTS_DOMAIN       Default: https://accounts.zoho.eu
+ *   CRM_API_VERSION            Default: v2
  *   FIXER_API_BASE             Default: https://data.fixer.io/api
  *   CRM_MODULE                 Default: "Products"
  *   CRM_STATUS_FIELD           Default: "Status"
@@ -124,12 +129,12 @@ function requireEnv(name) {
 function loadConfig() {
   const args = parseArgs(process.argv.slice(2));
   return {
-    clientId: requireEnv('ZOHO_CRM_CLIENT_ID'),
-    clientSecret: requireEnv('ZOHO_CRM_CLIENT_SECRET'),
-    refreshToken: requireEnv('ZOHO_CRM_REFRESH_TOKEN'),
-    apiDomain: (process.env.ZOHO_CRM_API_DOMAIN || 'https://www.zohoapis.eu').replace(/\/$/, ''),
-    accountsDomain: (process.env.ZOHO_CRM_ACCOUNTS_DOMAIN || 'https://accounts.zoho.eu').replace(/\/$/, ''),
-    apiVersion: process.env.ZOHO_CRM_API_VERSION || 'v2',
+    clientId: requireEnv('ZOHO_CLIENT_ID'),
+    clientSecret: requireEnv('ZOHO_CLIENT_SECRET'),
+    refreshToken: requireEnv('ZOHO_REFRESH_TOKEN'),
+    apiDomain: (process.env.ZOHO_API_DOMAIN || 'https://www.zohoapis.eu').replace(/\/$/, ''),
+    accountsDomain: (process.env.ZOHO_ACCOUNTS_DOMAIN || 'https://accounts.zoho.eu').replace(/\/$/, ''),
+    apiVersion: process.env.CRM_API_VERSION || 'v2',
     fixerApiKey: requireEnv('FIXER_API_KEY'),
     fixerApiBase: (process.env.FIXER_API_BASE || 'https://data.fixer.io/api').replace(/\/$/, ''),
 
