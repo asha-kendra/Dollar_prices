@@ -13,7 +13,17 @@ app.use(express.json());
 const MAX_HOPS = Number(process.env.MAX_CHAIN_HOPS || 200);
 
 function buildNextUrl(req, cursor, hop) {
-	const base = process.env.SELF_INVOKE_URL || `${req.protocol}://${req.get("host")}${req.baseUrl}${req.path}`;
+	// Catalyst terminates TLS at its edge and forwards internally over plain
+	// HTTP, so req.protocol reports "http" even though the externally-facing
+	// Host header it forwards already carries ":443" - left unchecked that
+	// produces "http://host:443/...", which is plaintext HTTP to a TLS-only
+	// port and can never connect, silently breaking the chain. Always force
+	// https and strip any port so the fallback is actually reachable.
+	let base = process.env.SELF_INVOKE_URL;
+	if (!base) {
+		const host = req.get("host").replace(/:\d+$/, "");
+		base = `https://${host}${req.baseUrl}${req.path}`;
+	}
 	const url = new URL(base);
 	url.searchParams.set("statusIndex", cursor.statusIndex);
 	url.searchParams.set("page", cursor.page);
