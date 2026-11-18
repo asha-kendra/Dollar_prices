@@ -49,9 +49,27 @@
  * If more than one Item Attribute record links to the same item, the most recently
  * modified record wins; conflicts are logged.
  *
- * This file is shared by two entry points:
- *   - scripts/sync-gbp-prices.js       CLI usage (node scripts/sync-gbp-prices.js ...)
- *   - functions/sync-gbp-prices/index.js  Zoho Catalyst Advanced I/O function handler
+ * This file is shared by two entry points, which run the sync differently:
+ *   - scripts/sync-gbp-prices.js          CLI usage - calls main(), which does
+ *                                         the ENTIRE catalog in one run. Fine
+ *                                         here since there's no execution time
+ *                                         limit on a plain `node` process.
+ *   - functions/sync-gbp-prices/index.js  Zoho Catalyst Advanced I/O handler -
+ *                                         calls runBatch(cursor) instead, which
+ *                                         processes only ONE page (<= 200 items)
+ *                                         of ONE status value per HTTP call,
+ *                                         because a serverless function has a
+ *                                         hard execution time limit that a
+ *                                         full-catalog run exceeds once there
+ *                                         are thousands of eligible+priced
+ *                                         items (confirmed in production).
+ *                                         The response includes a `next` cursor;
+ *                                         the caller (a Zoho Deluge schedule, in
+ *                                         this org's case) is expected to LOOP,
+ *                                         re-calling with that cursor as a query
+ *                                         string (?statusIndex=&page=&exchangeRate=)
+ *                                         until `next` comes back null. See
+ *                                         runBatch()'s own doc comment below.
  *
  * ---------------------------------------------------------------------------
  * Required environment variables (self-client / server-based Zoho OAuth app):
@@ -327,6 +345,18 @@ class ZohoClient {
     return items;
   }
 
+  // Fetches exactly one page - used by runBatch() so a single HTTP call to the
+  // Catalyst function only ever does a small, fast, bounded amount of work
+  // (see runBatch's doc comment for why).
+  async listItemsByStatusPage(statusField, statusValue, page, perPage) {
+    const json = await this.request('items', {
+      query: { page, per_page: perPage, [statusField]: statusValue },
+    });
+    const items = json.items || [];
+    const hasMore = !!(json.page_context && json.page_context.has_more_page);
+    return { items, hasMore };
+  }
+
   // Looks up the single most-recently-modified custom module record whose
   // lookup field matches lookupValue, via the same direct field filter used
   // for cf_status. Used for --limit runs so we don't have to bulk-fetch the
@@ -570,4 +600,143 @@ async function main() {
   return summary;
 }
 
-module.exports = { main };
+// runBatch() processes exactly ONE page (<= pageSize items) of ONE status
+// value, then returns. It exists because main() - which processes the whole
+// catalog in one call - cannot finish inside a serverless function's
+// execution time limit (confirmed in production: EXECUTION_TIME_EXCEEDED /
+// a 408 from the caller) once there are thousands of eligible+priced items.
+//
+// The caller (the Catalyst function's index.js, triggered by a Zoho Deluge
+// schedule) is expected to LOOP: call this, read the returned `next` cursor,
+// and call again with that cursor, repeating until `next` is null. Each
+// individual call only does a small, bounded amount of work (one page's
+// worth of lookups/updates, run concurrently) so it comfortably finishes
+// well inside any execution time limit - the full catalog gets covered by
+// many quick calls instead of one slow one.
+//
+// cursor: { statusIndex, page, exchangeRate }
+//   - statusIndex: which entry in config.allowedStatuses to read from.
+//   - page: which page (of config.pageSize items) within that status.
+//   - exchangeRate: the rate to reuse for this whole run (fetched fresh on
+//     the first call when omitted, then passed through on every subsequent
+//     call so the entire day's run converts at one consistent rate instead
+//     of a slightly different one on every page).
+async function runBatch(cursor = {}) {
+  const config = loadConfig();
+  const client = new ZohoClient(config);
+
+  const statusIndex = Number(cursor.statusIndex ?? 0);
+  const page = Number(cursor.page ?? 1);
+  const exchangeRate = cursor.exchangeRate ? Number(cursor.exchangeRate) : await fetchFixerUsdToGbpRate(config);
+
+  const statusValue = config.allowedStatuses[statusIndex];
+  const summary = {
+    exchangeRate,
+    statusValue: statusValue || null,
+    statusIndex,
+    page,
+    scanned: 0,
+    updated: 0,
+    skippedNotEligible: 0,
+    errors: 0,
+    updatedSkus: [],
+    exchangeRateRecordsUpdated: 0,
+    exchangeRateRecordErrors: 0,
+  };
+
+  if (!statusValue) {
+    console.log('[batch] no more statuses to process - done.');
+    return { summary, next: null };
+  }
+
+  console.log(`[batch] status="${statusValue}" (index ${statusIndex}) page=${page}, exchangeRate=${exchangeRate}`);
+  const { items, hasMore } = await client.listItemsByStatusPage(config.statusField, statusValue, page, config.pageSize);
+  console.log(`[batch] fetched ${items.length} item(s) (hasMore=${hasMore})`);
+
+  const eligibleItems = new Map();
+  for (const item of items) {
+    eligibleItems.set(item.item_id, {
+      name: item.name,
+      sku: item.sku,
+      rate: toNumber(item.rate) ?? 0,
+      status: statusValue,
+      caratTotal: toNumber(item[config.caratField]),
+    });
+  }
+
+  if (eligibleItems.size > 0) {
+    const found = await mapWithConcurrency([...eligibleItems], config.concurrency, async ([itemId]) =>
+      client.findCustomModuleRecordByLookup(config.moduleName, config.lookupField, itemId)
+    );
+    const records = found.filter(Boolean);
+    summary.scanned = records.length;
+
+    const updatesByItem = pickLatestPerItem(records, config, exchangeRate);
+
+    const exchangeRateWrites = mapWithConcurrency([...updatesByItem.values()], config.concurrency, async (update) => {
+      if (config.dryRun) {
+        summary.exchangeRateRecordsUpdated += 1;
+        return;
+      }
+      try {
+        await client.updateCustomModuleRecord(config.moduleName, update.recordId, {
+          record_name: update.recordName,
+          [config.exchangeRateField]: exchangeRate,
+        });
+        summary.exchangeRateRecordsUpdated += 1;
+      } catch (err) {
+        console.error(`[error] failed to set ${config.exchangeRateField} on record ${update.recordId}: ${err.message}`);
+        summary.exchangeRateRecordErrors += 1;
+      }
+    });
+
+    await mapWithConcurrency([...updatesByItem.values()], config.concurrency, async (update) => {
+      const item = eligibleItems.get(update.itemId);
+      if (!item) {
+        summary.skippedNotEligible += 1;
+        return;
+      }
+
+      const mainTotal = item.caratTotal !== null ? roundCurrency(update.gbpPrice * item.caratTotal) : null;
+      const line =
+        `item ${update.itemId} (${item.name}, SKU ${item.sku}): USD ${update.usdPrice} x ${update.exchangeRate} ` +
+        `= £${update.gbpPrice} (current £${item.rate}, status "${item.status}")` +
+        (mainTotal !== null ? `, ${config.mainTotalField} -> £${mainTotal}` : '');
+
+      if (config.dryRun) {
+        console.log(`[batch][dry-run] would update ${line}`);
+        summary.updated += 1;
+        summary.updatedSkus.push(item.sku);
+        return;
+      }
+
+      const body = { name: item.name, rate: update.gbpPrice };
+      if (mainTotal !== null) {
+        body.custom_fields = [{ api_name: config.mainTotalField, value: mainTotal }];
+      }
+
+      try {
+        await client.updateItem(update.itemId, body);
+        console.log(`[batch][updated] ${line}`);
+        summary.updated += 1;
+        summary.updatedSkus.push(item.sku);
+      } catch (err) {
+        console.error(`[error] failed to update item ${update.itemId}: ${err.message}`);
+        summary.errors += 1;
+      }
+    });
+
+    await exchangeRateWrites;
+  }
+
+  const next = hasMore
+    ? { statusIndex, page: page + 1, exchangeRate }
+    : statusIndex + 1 < config.allowedStatuses.length
+      ? { statusIndex: statusIndex + 1, page: 1, exchangeRate }
+      : null;
+
+  console.log('[batch] summary:', summary, 'next:', next);
+  return { summary, next };
+}
+
+module.exports = { main, runBatch };
