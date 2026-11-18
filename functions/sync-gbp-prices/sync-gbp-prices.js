@@ -109,17 +109,17 @@
  *                          summary's updatedSkus lists exactly which SKUs changed.
  *   CONCURRENCY            How many items' price-lookup/update calls run at once
  *                          (step 2's per-item lookups when ITEM_LIMIT is set, and
- *                          step 4's updates always). Default: 0, meaning
- *                          unbounded - every item's call fires at once rather
- *                          than being queued behind a fixed-size window.
- *                          Serverless functions have a hard execution time
- *                          limit, and doing hundreds/thousands of items one at
- *                          a time - each a network round trip - can exceed it;
- *                          running them all concurrently is what keeps a run
- *                          inside that budget. request()'s existing 429
- *                          retry/backoff absorbs Zoho's rate limiting, but set
- *                          this to a positive number to cap how many run at
- *                          once if that's not enough.
+ *                          step 4's updates always; also used by runBatch()).
+ *                          Default: 10. Confirmed in production that unbounded
+ *                          concurrency (every item's call at once) is actively
+ *                          harmful, not just unnecessary - it caused
+ *                          EXECUTION_TIME_EXCEEDED even for a single ~200-item
+ *                          page, almost certainly a 429 retry storm and/or
+ *                          socket/memory contention from hundreds of
+ *                          simultaneous requests in a memory-constrained
+ *                          serverless function. 10 keeps both well-behaved;
+ *                          raise it cautiously if you've confirmed it's safe
+ *                          for your Zoho plan's rate limits.
  *
  * CLI usage:
  *   node scripts/sync-gbp-prices.js [--dry-run]
@@ -131,7 +131,7 @@
  *     [--main-total-field=cf_main_total]
  *     [--exchange-rate-field=cf_current_exchange_rate_dollar_to_gbp]
  *     [--limit=10]
- *     [--round-to=5] [--page-size=200] [--delay-ms=250]
+ *     [--round-to=5] [--page-size=100] [--delay-ms=250]
  *
  *   --dry-run            Compute and log what would change without writing to Zoho.
  *   --status-field       Same as ITEM_STATUS_FIELD above; this flag takes precedence
@@ -193,12 +193,14 @@ function loadConfig() {
     mainTotalField: args['main-total-field'] || process.env.MAIN_TOTAL_FIELD || 'cf_main_total',
     exchangeRateField: args['exchange-rate-field'] || process.env.EXCHANGE_RATE_FIELD || 'cf_current_exchange_rate_dollar_to_gbp',
     limit: Number(args.limit ?? process.env.ITEM_LIMIT ?? 0),
-    // 0 = unbounded: fire every item's call at once and let request()'s 429
-    // retry/backoff self-throttle against Zoho's rate limits, rather than
-    // artificially capping how many run in parallel.
-    concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 0),
+    // Confirmed in production: unbounded concurrency (every item's call fired
+    // at once) caused EXECUTION_TIME_EXCEEDED even for a single ~200-item page -
+    // likely a 429 retry storm and/or socket/memory contention from hundreds
+    // of simultaneous requests in a 256MB function. 10 at a time is gentle on
+    // both.
+    concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 10),
     roundTo: Number(args['round-to'] ?? 5),
-    pageSize: Number(args['page-size'] ?? 200),
+    pageSize: Number(args['page-size'] ?? 100),
     delayMs: Number(args['delay-ms'] ?? 250),
   };
 }
@@ -209,11 +211,11 @@ function sleep(ms) {
 
 // Runs worker(item) over items with at most `concurrency` in flight at once
 // (0 or falsy means unbounded - run every item at once), preserving each
-// result at its original index. Per-item Zoho calls (price lookups, updates)
-// don't need to be serialized with an artificial delay between them the way
-// page-to-page pagination does - request() already retries on 429 - so
-// running them concurrently is what keeps a run inside a serverless
-// function's execution time limit.
+// result at its original index. A modest bounded concurrency (default 10) is
+// what actually keeps a run inside a serverless function's execution time
+// limit - confirmed in production that unbounded (firing hundreds of
+// requests at once) made things WORSE, not better, triggering
+// EXECUTION_TIME_EXCEEDED even for a single ~200-item page.
 async function mapWithConcurrency(items, concurrency, worker) {
   const results = new Array(items.length);
   let nextIndex = 0;
