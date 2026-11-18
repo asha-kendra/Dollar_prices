@@ -56,20 +56,29 @@
  *                                         limit on a plain `node` process.
  *   - functions/sync-gbp-prices/index.js  Zoho Catalyst Advanced I/O handler -
  *                                         calls runBatch(cursor) instead, which
- *                                         processes only ONE page (<= 200 items)
- *                                         of ONE status value per HTTP call,
+ *                                         processes only ONE page (<= pageSize
+ *                                         items) of ONE status value per call,
  *                                         because a serverless function has a
  *                                         hard execution time limit that a
  *                                         full-catalog run exceeds once there
  *                                         are thousands of eligible+priced
- *                                         items (confirmed in production).
- *                                         The response includes a `next` cursor;
- *                                         the caller (a Zoho Deluge schedule, in
- *                                         this org's case) is expected to LOOP,
- *                                         re-calling with that cursor as a query
- *                                         string (?statusIndex=&page=&exchangeRate=)
- *                                         until `next` comes back null. See
- *                                         runBatch()'s own doc comment below.
+ *                                         items (confirmed in production, as
+ *                                         was unbounded concurrency making
+ *                                         things WORSE - see CONCURRENCY below).
+ *                                         index.js self-chains through the
+ *                                         `next` cursor runBatch() returns -
+ *                                         after each page it fires an
+ *                                         unawaited request to its own URL for
+ *                                         the next page, then responds to its
+ *                                         own caller immediately. So a single
+ *                                         external trigger (e.g. one call a day
+ *                                         from a Zoho Inventory schedule) walks
+ *                                         the entire catalog via many quick,
+ *                                         independent invocations chained
+ *                                         together, without the external
+ *                                         caller needing to loop itself. See
+ *                                         index.js and runBatch()'s own doc
+ *                                         comment below for the mechanics.
  *
  * ---------------------------------------------------------------------------
  * Required environment variables (self-client / server-based Zoho OAuth app):
@@ -120,6 +129,17 @@
  *                          serverless function. 10 keeps both well-behaved;
  *                          raise it cautiously if you've confirmed it's safe
  *                          for your Zoho plan's rate limits.
+ *
+ * Also read directly by functions/sync-gbp-prices/index.js (not loadConfig
+ * above) for the self-chaining behavior described near the top of this file:
+ *   SELF_INVOKE_URL        Override for the URL index.js calls itself at for
+ *                          the next hop. Default: derived from the incoming
+ *                          request's own protocol/host/path, which should be
+ *                          correct as-is - only set this if that's wrong in
+ *                          your environment.
+ *   MAX_CHAIN_HOPS         Safety cap on how many self-triggered hops one
+ *                          external call is allowed to chain through, in case
+ *                          `next` somehow never becomes null. Default: 200.
  *
  * CLI usage:
  *   node scripts/sync-gbp-prices.js [--dry-run]
@@ -608,13 +628,15 @@ async function main() {
 // execution time limit (confirmed in production: EXECUTION_TIME_EXCEEDED /
 // a 408 from the caller) once there are thousands of eligible+priced items.
 //
-// The caller (the Catalyst function's index.js, triggered by a Zoho Deluge
-// schedule) is expected to LOOP: call this, read the returned `next` cursor,
-// and call again with that cursor, repeating until `next` is null. Each
-// individual call only does a small, bounded amount of work (one page's
-// worth of lookups/updates, run concurrently) so it comfortably finishes
-// well inside any execution time limit - the full catalog gets covered by
-// many quick calls instead of one slow one.
+// This function itself does NOT loop or chain - it's deliberately just "do
+// one bounded page." The chaining (triggering the next page, repeating until
+// `next` is null) is index.js's job: it self-invokes with the returned
+// cursor after each call. That split is what lets a single external trigger
+// (one call a day from Zoho Inventory) walk the whole catalog without that
+// external caller needing any looping logic of its own - every individual
+// HTTP call, whether the first or the two-hundredth, only ever does a small,
+// bounded amount of work (one page's worth of lookups/updates, run
+// concurrently) and finishes well inside the execution time limit.
 //
 // cursor: { statusIndex, page, exchangeRate }
 //   - statusIndex: which entry in config.allowedStatuses to read from.
