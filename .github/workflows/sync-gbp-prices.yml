@@ -10,7 +10,7 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  sync:
+  sync-inventory:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Run GBP price sync
+      - name: Run Inventory GBP price sync
         working-directory: scripts
         run: node sync-gbp-prices.js
         env:
@@ -35,3 +35,30 @@ jobs:
           CONCURRENCY: "10"
           REQUESTS_PER_BREAK: "100"
           BREAK_MS: "25000"
+
+  sync-crm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run CRM GBP price sync
+        working-directory: scripts
+        run: node sync-gbp-prices-crm.js
+        env:
+          # Separate OAuth client/refresh token from the Inventory job above -
+          # this is a CRM-scoped self-client, not the Inventory-scoped one.
+          ZOHO_CLIENT_ID: ${{ secrets.CRM_ZOHO_CLIENT_ID }}
+          ZOHO_CLIENT_SECRET: ${{ secrets.CRM_ZOHO_CLIENT_SECRET }}
+          ZOHO_REFRESH_TOKEN: ${{ secrets.CRM_ZOHO_REFRESH_TOKEN }}
+          # Same Zoho .eu domains and fixer.io account as the Inventory job,
+          # so these secrets are shared rather than duplicated.
+          ZOHO_API_DOMAIN: ${{ secrets.ZOHO_API_DOMAIN }}
+          ZOHO_ACCOUNTS_DOMAIN: ${{ secrets.ZOHO_ACCOUNTS_DOMAIN }}
+          FIXER_API_KEY: ${{ secrets.FIXER_API_KEY }}
+          FIXER_API_BASE: ${{ secrets.FIXER_API_BASE }}
+          ITEM_STATUS_VALUES: ${{ secrets.ITEM_STATUS_VALUES }}
+          CONCURRENCY: "10"
