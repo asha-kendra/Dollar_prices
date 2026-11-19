@@ -266,16 +266,27 @@ function toNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+// Module-scope (not per-ZohoClient-instance) so the token survives across
+// invocations on the same warm container. runBatch() creates a brand new
+// ZohoClient on every call - one per page/hop - so an instance-level cache
+// bought nothing: every single hop was refreshing the OAuth token from
+// scratch. Confirmed in production: running enough hops in quick succession
+// this way tripped Zoho's own abuse lockout on the refresh_token endpoint
+// ("You have made too many requests continuously"), independent of which
+// mechanism (Catalyst self-chain or an external Deluge loop) drives the
+// hops - access tokens are valid for ~1 hour and should be reused, not
+// refreshed per call.
+let cachedAccessToken = null;
+let cachedAccessTokenExpiresAt = 0;
+
 class ZohoClient {
   constructor(config) {
     this.config = config;
-    this.accessToken = null;
-    this.accessTokenExpiresAt = 0;
   }
 
   async getAccessToken() {
-    if (this.accessToken && Date.now() < this.accessTokenExpiresAt) {
-      return this.accessToken;
+    if (cachedAccessToken && Date.now() < cachedAccessTokenExpiresAt) {
+      return cachedAccessToken;
     }
     const { accountsDomain, clientId, clientSecret, refreshToken } = this.config;
     const url = new URL(`${accountsDomain}/oauth/v2/token`);
@@ -289,10 +300,10 @@ class ZohoClient {
     if (!res.ok || !body.access_token) {
       throw new Error(`Failed to refresh Zoho access token: ${JSON.stringify(body)}`);
     }
-    this.accessToken = body.access_token;
+    cachedAccessToken = body.access_token;
     // Refresh a little early to avoid edge-of-expiry failures mid-run.
-    this.accessTokenExpiresAt = Date.now() + (Number(body.expires_in || 3600) - 60) * 1000;
-    return this.accessToken;
+    cachedAccessTokenExpiresAt = Date.now() + (Number(body.expires_in || 3600) - 60) * 1000;
+    return cachedAccessToken;
   }
 
   async request(path, { method = 'GET', query = {}, body } = {}, attempt = 1) {
