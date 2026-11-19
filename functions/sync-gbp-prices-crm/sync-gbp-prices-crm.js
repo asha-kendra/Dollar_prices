@@ -167,8 +167,18 @@ function loadConfig() {
     // one. 200 is what this org's plan actually allows.
     pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
+    // Same org-level throttle added to the Inventory version after it hit
+    // Zoho's "exceeded the maximum number of requests per minute" lockout
+    // (code 44, Inventory API) - that cap is enforced by Zoho per
+    // organization, not per API or per calling platform, so CRM calls count
+    // against it too even though COQL+bulk-update already means far fewer
+    // calls than the Inventory version made.
+    requestsPerBreak: Number(args['requests-per-break'] ?? process.env.REQUESTS_PER_BREAK ?? 100),
+    breakMs: Number(args['break-ms'] ?? process.env.BREAK_MS ?? 25000),
   };
 }
+
+let totalApiCalls = 0;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -240,6 +250,12 @@ class CrmClient {
   }
 
   async request(path, { method = 'GET', body } = {}, attempt = 1) {
+    totalApiCalls += 1;
+    if (totalApiCalls % this.config.requestsPerBreak === 0) {
+      console.log(`[throttle] ${totalApiCalls} API call(s) made - pausing ${this.config.breakMs}ms to stay under the org's per-minute request cap.`);
+      await sleep(this.config.breakMs);
+    }
+
     const token = await this.getAccessToken();
     const url = `${this.config.apiDomain}/crm/${this.config.apiVersion}/${path}`;
 

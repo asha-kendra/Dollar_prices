@@ -62,3 +62,5 @@ jobs:
           FIXER_API_BASE: ${{ secrets.FIXER_API_BASE }}
           ITEM_STATUS_VALUES: ${{ secrets.ITEM_STATUS_VALUES }}
           CONCURRENCY: "10"
+          REQUESTS_PER_BREAK: "100"
+          BREAK_MS: "25000"
