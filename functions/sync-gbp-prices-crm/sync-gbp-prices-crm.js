@@ -159,7 +159,7 @@ function loadConfig() {
     // the same bounded value that's proven safe there instead of 0/unbounded.
     concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 10),
     roundTo: Number(args['round-to'] ?? 5),
-    pageSize: Number(args['page-size'] ?? 200),
+    pageSize: Number(args['page-size'] ?? 2000),
     delayMs: Number(args['delay-ms'] ?? 250),
   };
 }
