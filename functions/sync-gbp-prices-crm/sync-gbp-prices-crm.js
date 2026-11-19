@@ -160,7 +160,12 @@ function loadConfig() {
     // the same bounded value that's proven safe there instead of 0/unbounded.
     concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 10),
     roundTo: Number(args['round-to'] ?? 5),
-    pageSize: Number(args['page-size'] ?? 2000),
+    // Zoho's docs say COQL's LIMIT maxes out at 2000, but confirmed live
+    // against this org: it rejects anything over 200 with
+    // {"code":"LIMIT_EXCEEDED","details":{"by":"limit","limit":200}} - so
+    // 2000 is apparently only available on some CRM editions/plans, not this
+    // one. 200 is what this org's plan actually allows.
+    pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
   };
 }
