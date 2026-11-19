@@ -222,8 +222,18 @@ function loadConfig() {
     roundTo: Number(args['round-to'] ?? 5),
     pageSize: Number(args['page-size'] ?? process.env.PAGE_SIZE ?? 100),
     delayMs: Number(args['delay-ms'] ?? 250),
+    // Confirmed in production: Zoho returns {"code":44,"message":"...exceeded
+    // the maximum number of requests per minute that can originate from an
+    // organization."} once the ORG (not just this script) crosses its own
+    // per-minute request cap. Pausing every requestsPerBreak calls keeps the
+    // whole run's throughput under that cap instead of bursting as fast as
+    // possible.
+    requestsPerBreak: Number(args['requests-per-break'] ?? process.env.REQUESTS_PER_BREAK ?? 100),
+    breakMs: Number(args['break-ms'] ?? process.env.BREAK_MS ?? 25000),
   };
 }
+
+let totalApiCalls = 0;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -307,6 +317,12 @@ class ZohoClient {
   }
 
   async request(path, { method = 'GET', query = {}, body } = {}, attempt = 1) {
+    totalApiCalls += 1;
+    if (totalApiCalls % this.config.requestsPerBreak === 0) {
+      console.log(`[throttle] ${totalApiCalls} API call(s) made - pausing ${this.config.breakMs}ms to stay under the org's per-minute request cap.`);
+      await sleep(this.config.breakMs);
+    }
+
     const token = await this.getAccessToken();
     const url = new URL(`${this.config.apiDomain}/inventory/v1/${path}`);
     url.searchParams.set('organization_id', this.config.organizationId);
@@ -335,6 +351,16 @@ class ZohoClient {
       json = text ? JSON.parse(text) : {};
     } catch {
       throw new Error(`Non-JSON response from ${method} ${path}: ${text.slice(0, 500)}`);
+    }
+
+    // code 44: org-wide "exceeded the maximum number of requests per minute"
+    // lockout - confirmed in production. Distinct from the per-request 429
+    // above; back off much longer since this is a whole-organization cooldown,
+    // not a single endpoint's rate limit.
+    if (json.code === 44 && attempt <= 5) {
+      console.log(`[throttle] org-level rate limit hit (code 44) on attempt ${attempt} - backing off ${attempt * 60}s.`);
+      await sleep(attempt * 60000);
+      return this.request(path, { method, query, body }, attempt + 1);
     }
 
     if (!res.ok || (typeof json.code === 'number' && json.code !== 0)) {

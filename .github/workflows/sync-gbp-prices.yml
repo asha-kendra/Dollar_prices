@@ -1,0 +1,37 @@
+name: Sync GBP prices
+
+on:
+  schedule:
+    # Approximate 09:00 and 18:00 Europe/London - cron is UTC only, so this
+    # drifts by an hour across the BST/GMT daylight-saving switch. Adjust if
+    # that matters.
+    - cron: "0 9 * * *"
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run GBP price sync
+        working-directory: scripts
+        run: node sync-gbp-prices.js
+        env:
+          ZOHO_ORGANIZATION_ID: ${{ secrets.ZOHO_ORGANIZATION_ID }}
+          ZOHO_CLIENT_ID: ${{ secrets.ZOHO_CLIENT_ID }}
+          ZOHO_CLIENT_SECRET: ${{ secrets.ZOHO_CLIENT_SECRET }}
+          ZOHO_REFRESH_TOKEN: ${{ secrets.ZOHO_REFRESH_TOKEN }}
+          ZOHO_API_DOMAIN: ${{ secrets.ZOHO_API_DOMAIN }}
+          ZOHO_ACCOUNTS_DOMAIN: ${{ secrets.ZOHO_ACCOUNTS_DOMAIN }}
+          FIXER_API_KEY: ${{ secrets.FIXER_API_KEY }}
+          FIXER_API_BASE: ${{ secrets.FIXER_API_BASE }}
+          ITEM_STATUS_VALUES: ${{ secrets.ITEM_STATUS_VALUES }}
+          CONCURRENCY: "10"
+          REQUESTS_PER_BREAK: "100"
+          BREAK_MS: "25000"
