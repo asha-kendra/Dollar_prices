@@ -220,7 +220,7 @@ function loadConfig() {
     // both.
     concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 10),
     roundTo: Number(args['round-to'] ?? 5),
-    pageSize: Number(args['page-size'] ?? 100),
+    pageSize: Number(args['page-size'] ?? process.env.PAGE_SIZE ?? 100),
     delayMs: Number(args['delay-ms'] ?? 250),
   };
 }
