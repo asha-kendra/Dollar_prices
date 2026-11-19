@@ -39,11 +39,12 @@
  *      Written EVERY run, same as the Inventory version - never skipped as
  *      "unchanged". Use --dry-run to preview without writing.
  *
- * NOTE: COQL's offset-based pagination is only reliable up to ~2000 records per
- * query in Zoho CRM. If your Products catalog has more eligible+priced records
- * than that, this will need an additional partitioning strategy (e.g. querying
- * by Modified_Time windows) - not implemented here since it wasn't needed for
- * the Inventory org's current scale.
+ * NOTE: per Zoho's own COQL docs, LIMIT maxes out at 2000 records per call, but
+ * OFFSET+LIMIT can paginate up to 100,000 records total with the same WHERE
+ * criteria (what this script does - just incrementing offset by pageSize each
+ * call). Only beyond 100,000 total matching records would this need the
+ * documented id>{last_id} partitioning technique instead - not implemented
+ * here since it's far beyond this org's scale.
  *
  * This file is shared by two entry points:
  *   - scripts/sync-gbp-prices-crm.js           CLI usage
