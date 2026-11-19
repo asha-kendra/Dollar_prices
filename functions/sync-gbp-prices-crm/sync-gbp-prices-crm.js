@@ -153,7 +153,11 @@ function loadConfig() {
     skuField: args['sku-field'] || process.env.CRM_SKU_FIELD || 'Product_Code',
     nameField: args['name-field'] || process.env.CRM_NAME_FIELD || 'Product_Name',
     limit: Number(args.limit ?? process.env.ITEM_LIMIT ?? 0),
-    concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 0),
+    // Confirmed on the Inventory version: unbounded concurrency (every batch
+    // fired at once) caused EXECUTION_TIME_EXCEEDED, not just wasted effort -
+    // likely a 429 retry storm and/or socket/memory contention. Default to
+    // the same bounded value that's proven safe there instead of 0/unbounded.
+    concurrency: Number(args.concurrency ?? process.env.CONCURRENCY ?? 10),
     roundTo: Number(args['round-to'] ?? 5),
     pageSize: Number(args['page-size'] ?? 200),
     delayMs: Number(args['delay-ms'] ?? 250),
