@@ -266,10 +266,13 @@ class CrmClient {
     return json;
   }
 
-  // Fetches eligible+priced records in one place via COQL, replacing both the
-  // "fetch eligible items" and "fetch USD price" steps from the Inventory
-  // version, since both live on the same Products record here.
-  async queryEligibleProducts(config) {
+  // Fetches eligible+priced records via COQL, one page (config.pageSize, max
+  // 200 - COQL's own hard per-call limit) at a time, invoking onPage(records)
+  // for each page as soon as it arrives rather than accumulating everything
+  // first - so the caller can compute and write each page back immediately
+  // instead of waiting for the whole catalog to be fetched before any update
+  // happens.
+  async queryEligibleProducts(config, onPage) {
     const fields = [
       'id', config.nameField, config.skuField, config.priceField,
       config.rateField, config.caratField, config.statusField,
@@ -277,23 +280,25 @@ class CrmClient {
     const statusList = config.allowedStatuses.map(coqlString).join(', ');
     const whereClause = `${config.statusField} in (${statusList}) and ${config.priceField} > 0`;
 
-    const records = [];
+    let fetched = 0;
     let offset = 0;
     for (;;) {
-      const pageLimit = config.limit ? Math.min(config.pageSize, config.limit - records.length) : config.pageSize;
+      const pageLimit = config.limit ? Math.min(config.pageSize, config.limit - fetched) : config.pageSize;
       if (config.limit && pageLimit <= 0) break;
 
       const query = `select ${fields.join(', ')} from ${config.moduleName} where ${whereClause} limit ${pageLimit} offset ${offset}`;
       const json = await this.request('coql', { method: 'POST', body: { select_query: query } });
       const pageRecords = json.data || [];
-      records.push(...pageRecords);
+      const pageToProcess = config.limit ? pageRecords.slice(0, config.limit - fetched) : pageRecords;
+      fetched += pageToProcess.length;
+      await onPage(pageToProcess);
 
-      if (config.limit && records.length >= config.limit) return records.slice(0, config.limit);
+      if (config.limit && fetched >= config.limit) break;
       if (!json.info || !json.info.more_records) break;
       offset += pageRecords.length;
       await sleep(config.delayMs);
     }
-    return records;
+    return fetched;
   }
 
   // Zoho CRM's record update endpoint accepts an array of up to 100 records
@@ -326,91 +331,94 @@ async function main() {
   const config = loadConfig();
   const client = new CrmClient(config);
 
-  // Step 1: query eligible, priced Products in one COQL call (per page).
-  console.log(
-    `Querying ${config.moduleName} where ${config.statusField} in [${config.allowedStatuses.join(', ')}] ` +
-    `and ${config.priceField} > 0` + (config.limit ? ` (limit ${config.limit})` : '') + '...'
-  );
-  const records = await client.queryEligibleProducts(config);
-  console.log(`${records.length} eligible, priced record(s) found.`);
-  const eligibleSkus = records.map((r) => r[config.skuField]);
-  console.log(`SKUs: ${eligibleSkus.join(', ') || '(none)'}`);
-
-  // Step 2: compute gbp_price and main_total for each record.
+  // Fetched first (one call, not per-page) so every page below can compute
+  // gbp_price immediately instead of waiting until all pages are in.
   const exchangeRate = await fetchFixerUsdToGbpRate(config);
   console.log(`Live USD->GBP exchange rate from fixer.io: ${exchangeRate}`);
 
   const summary = {
     exchangeRate,
-    scanned: records.length,
-    eligibleSkus,
+    scanned: 0,
+    eligibleSkus: [],
     updated: 0,
     errors: 0,
     updatedSkus: [],
   };
 
-  const computed = records.map((record) => {
-    const usdPrice = toNumber(record[config.priceField]);
-    const caratTotal = toNumber(record[config.caratField]);
-    const gbpPrice = roundToNearest(usdPrice * exchangeRate, config.roundTo);
-    const mainTotal = caratTotal !== null ? roundCurrency(gbpPrice * caratTotal) : null;
-    if (caratTotal === null) {
-      console.warn(
-        `[warn] record ${record.id} (${record[config.skuField]}) has no ${config.caratField}; ` +
-        `leaving ${config.mainTotalField} untouched.`
-      );
-    }
-    return { record, usdPrice, caratTotal, gbpPrice, mainTotal };
-  });
+  console.log(
+    `Querying ${config.moduleName} where ${config.statusField} in [${config.allowedStatuses.join(', ')}] ` +
+    `and ${config.priceField} > 0` + (config.limit ? ` (limit ${config.limit})` : '') +
+    `, ${config.pageSize} per page, writing each page back before fetching the next...`
+  );
 
-  // Step 3: write rate/main_total/exchange_rate back, in batches of up to 100
-  // records per Zoho CRM API call, batches running with bounded concurrency.
-  const batches = [];
-  for (let i = 0; i < computed.length; i += 100) {
-    batches.push(computed.slice(i, i + 100));
-  }
+  await client.queryEligibleProducts(config, async (pageRecords) => {
+    summary.scanned += pageRecords.length;
+    summary.eligibleSkus.push(...pageRecords.map((r) => r[config.skuField]));
+    console.log(`Fetched ${pageRecords.length} record(s) this page (${summary.scanned} total so far).`);
 
-  await mapWithConcurrency(batches, config.concurrency, async (batch) => {
-    const payload = batch.map(({ record, gbpPrice, mainTotal }) => {
-      const entry = {
-        id: record.id,
-        [config.rateField]: gbpPrice,
-        [config.exchangeRateField]: String(exchangeRate),
-      };
-      if (mainTotal !== null) entry[config.mainTotalField] = mainTotal;
-      return entry;
+    const computed = pageRecords.map((record) => {
+      const usdPrice = toNumber(record[config.priceField]);
+      const caratTotal = toNumber(record[config.caratField]);
+      const gbpPrice = roundToNearest(usdPrice * exchangeRate, config.roundTo);
+      const mainTotal = caratTotal !== null ? roundCurrency(gbpPrice * caratTotal) : null;
+      if (caratTotal === null) {
+        console.warn(
+          `[warn] record ${record.id} (${record[config.skuField]}) has no ${config.caratField}; ` +
+          `leaving ${config.mainTotalField} untouched.`
+        );
+      }
+      return { record, usdPrice, caratTotal, gbpPrice, mainTotal };
     });
 
-    for (const { record, usdPrice, gbpPrice, mainTotal } of batch) {
-      const line =
-        `record ${record.id} (${record[config.nameField]}, SKU ${record[config.skuField]}): ` +
-        `USD ${usdPrice} x ${exchangeRate} = £${gbpPrice} (current £${toNumber(record[config.rateField]) ?? 0})` +
-        (mainTotal !== null ? `, ${config.mainTotalField} -> £${mainTotal}` : '');
-      console.log(config.dryRun ? `[dry-run] would update ${line}` : `[updating] ${line}`);
+    // This page's own records, split into Zoho's own hard cap of 100 records
+    // per update call (e.g. a 200-record page becomes 2 batches here).
+    const batches = [];
+    for (let i = 0; i < computed.length; i += 100) {
+      batches.push(computed.slice(i, i + 100));
     }
 
-    if (config.dryRun) {
-      summary.updated += batch.length;
-      summary.updatedSkus.push(...batch.map(({ record }) => record[config.skuField]));
-      return;
-    }
-
-    try {
-      const result = await client.updateProductsBatch(config.moduleName, payload);
-      const results = result.data || [];
-      results.forEach((r, i) => {
-        if (r.status === 'success') {
-          summary.updated += 1;
-          summary.updatedSkus.push(batch[i].record[config.skuField]);
-        } else {
-          console.error(`[error] failed to update record ${batch[i].record.id}: ${JSON.stringify(r)}`);
-          summary.errors += 1;
-        }
+    await mapWithConcurrency(batches, config.concurrency, async (batch) => {
+      const payload = batch.map(({ record, gbpPrice, mainTotal }) => {
+        const entry = {
+          id: record.id,
+          [config.rateField]: gbpPrice,
+          [config.exchangeRateField]: String(exchangeRate),
+        };
+        if (mainTotal !== null) entry[config.mainTotalField] = mainTotal;
+        return entry;
       });
-    } catch (err) {
-      console.error(`[error] batch update failed: ${err.message}`);
-      summary.errors += batch.length;
-    }
+
+      for (const { record, usdPrice, gbpPrice, mainTotal } of batch) {
+        const line =
+          `record ${record.id} (${record[config.nameField]}, SKU ${record[config.skuField]}): ` +
+          `USD ${usdPrice} x ${exchangeRate} = £${gbpPrice} (current £${toNumber(record[config.rateField]) ?? 0})` +
+          (mainTotal !== null ? `, ${config.mainTotalField} -> £${mainTotal}` : '');
+        console.log(config.dryRun ? `[dry-run] would update ${line}` : `[updating] ${line}`);
+      }
+
+      if (config.dryRun) {
+        summary.updated += batch.length;
+        summary.updatedSkus.push(...batch.map(({ record }) => record[config.skuField]));
+        return;
+      }
+
+      try {
+        const result = await client.updateProductsBatch(config.moduleName, payload);
+        const results = result.data || [];
+        results.forEach((r, i) => {
+          if (r.status === 'success') {
+            summary.updated += 1;
+            summary.updatedSkus.push(batch[i].record[config.skuField]);
+          } else {
+            console.error(`[error] failed to update record ${batch[i].record.id}: ${JSON.stringify(r)}`);
+            summary.errors += 1;
+          }
+        });
+      } catch (err) {
+        console.error(`[error] batch update failed: ${err.message}`);
+        summary.errors += batch.length;
+      }
+    });
   });
 
   console.log('\nSummary:', summary);
