@@ -1,0 +1,13 @@
+{
+  "name": "sync-gbp-prices-crm-staged",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "4.17.1",
+    "zcatalyst-sdk-node": "^2.0.0"
+  }
+}
